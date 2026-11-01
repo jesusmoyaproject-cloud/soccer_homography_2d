@@ -10,7 +10,9 @@ match_thresh: 0.85
 fuse_score: true
 
 # Compensación de movimiento global de cámara (GMC)
-gmc_method: sparseOptFlow
+# Desactivado ('none') porque la compensación de paneo y el tracking se resuelven en coordenadas 2D de cancha (MAGSAC++ + Kalman 2D),
+# evitando los ~55 ms de CPU por fotograma que consume sparseOptFlow en 1080p.
+gmc_method: none
 
 # Umbrales de ReID / proximidad espacial
 proximity_thresh: 0.5

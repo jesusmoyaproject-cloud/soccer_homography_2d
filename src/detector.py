@@ -266,10 +266,11 @@ class SoccerInferenceEngine:
         frame_bgr: np.ndarray,
         conf_low: float = 0.15,
         roi_box: Optional[Tuple[int, int, int, int]] = None,
+        fallback_full_frame: bool = False,
     ) -> Tuple[List[Dict[str, Any]], bool]:
         """
-        Estrategia de Inferencia de Balón: ROI Dinámico (Zoom Inteligente) + Full Frame Fallback
-        recolectando todos los candidatos desde `conf >= 0.15`.
+        Estrategia de Inferencia de Balón: ROI Dinámico (Zoom Inteligente) o Full Frame
+        recolectando todos los candidatos desde `conf >= 0.15` en una sola pasada de GPU por fotograma.
         Retorna: (lista_candidatos, se_uso_roi)
         """
         if roi_box is not None:
@@ -283,12 +284,12 @@ class SoccerInferenceEngine:
                     half=self.half,
                     verbose=False,
                 )[0]
+                roi_cands: List[Dict[str, Any]] = []
                 if res_roi.boxes is not None and len(res_roi.boxes) > 0:
                     boxes = res_roi.boxes.xyxy.cpu().numpy()
                     confs = res_roi.boxes.conf.cpu().numpy()
                     classes = res_roi.boxes.cls.cpu().numpy().astype(int)
                     order = np.argsort(-confs)
-                    roi_cands: List[Dict[str, Any]] = []
                     for rank, idx in enumerate(order):
                         score = float(confs[idx])
                         if score < conf_low:
@@ -305,10 +306,10 @@ class SoccerInferenceEngine:
                             "pitch_m": None,
                             "from_roi": True,
                         })
-                    if roi_cands:
-                        return roi_cands, True
+                if roi_cands or not fallback_full_frame:
+                    return roi_cands, True
 
-        # Fallback a Full Frame si no había ROI o el ROI no devolvió candidatos
+        # Inferencia en Full Frame cuando no hay ROI (estado LOST o barrido periódico)
         full_cands = self.infer_ball(frame_bgr, conf=conf_low)
         for c in full_cands:
             c["from_roi"] = False

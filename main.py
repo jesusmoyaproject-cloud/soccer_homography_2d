@@ -139,7 +139,10 @@ class Soccer2DTrackingPipeline:
 
         # 7. Seguimiento Avanzado de Balón: ROI Dinámico + Verosimilitud (conf>=0.15) + FSM
         if is_video:
-            roi_box = None if shot_cut else self.ball_tracker.get_dynamic_roi(w_img, h_img)
+            force_full_scan = shot_cut or (
+                self.ball_tracker.missing_frames >= 3 and self.ball_tracker.missing_frames % 3 == 0
+            )
+            roi_box = None if force_full_scan else self.ball_tracker.get_dynamic_roi(w_img, h_img)
             ball_cands, roi_used = self.detector.infer_ball_candidates(
                 frame_bgr,
                 conf_low=self.ball_tracker.conf_low,
