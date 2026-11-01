@@ -1,0 +1,18 @@
+# Inferencia Deep Learning y Modelos YOLO
+ultralytics>=8.0.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Visión por Computadora y Homografía (MAGSAC++)
+opencv-python>=4.8.0
+numpy>=1.23.0
+scipy>=1.10.0
+
+# Tracking y Asociación de Jugadores (BoT-SORT)
+lapx>=0.5.5
+
+# Configuración y Utilidades
+pyyaml>=6.0
+
+# Pruebas Unitarias y Validación
+pytest>=7.0.0
