@@ -207,11 +207,11 @@ class JerseyNumberRecognizer:
     def __init__(self, config: Optional[Dict[str, Any]] = None, use_gpu: bool = True):
         cfg = (config or {}).get("tracking_2d", {}).get("jersey_ocr", {})
         self.enabled = bool(cfg.get("enabled", True))
-        self.min_bbox_height = int(cfg.get("min_bbox_height_px", 52))
+        self.min_bbox_height = int(cfg.get("min_bbox_height_px", 60))
         self.min_conf = float(cfg.get("min_ocr_conf", 0.45))
-        self.interval_frames = max(1, int(cfg.get("ocr_interval_frames", 5)))
+        self.interval_frames = max(1, int(cfg.get("ocr_interval_frames", 10)))
         self.lock_conf_sum = float(cfg.get("lock_confidence_sum", 1.8))
-        self.max_crops_per_frame = int(cfg.get("max_crops_per_frame", 3))
+        self.max_crops_per_frame = int(cfg.get("max_crops_per_frame", 1))
         self.use_gpu = use_gpu
 
         self._reader = None

@@ -92,11 +92,11 @@ tracking_2d:
 
   jersey_ocr:
     enabled: true                # Lectura oportunista de dorsales con EasyOCR
-    min_bbox_height_px: 52       # Altura mínima en píxeles para intentar leer el dorsal
+    min_bbox_height_px: 60       # Solo evaluar cuando el jugador esté suficientemente grande/nítido
     min_ocr_conf: 0.45           # Confianza mínima de EasyOCR por lectura
-    ocr_interval_frames: 5       # Intervalo de cuadros entre lecturas para un mismo track_id
+    ocr_interval_frames: 10      # Intervalo de cuadros entre lecturas para un mismo track_id (optimizado)
     lock_confidence_sum: 1.8     # Suma de confianza acumulada para dar por confirmado el dorsal
-    max_crops_per_frame: 3       # Máximo de recortes evaluados por cuadro para mantener altos FPS
+    max_crops_per_frame: 1       # Máximo 1 recorte evaluado por cuadro (evita cuello de botella de FPS)
 
   stitching:
     max_speed_mps: 12.0          # Límite cinemático para unir fragmentos en la Pasada 2

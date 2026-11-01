@@ -29,6 +29,7 @@ from src.tracker_2d import PitchBoTSORT2D
 from src.tracklet_stitcher import GlobalTrackletStitcher
 from src.ball_tracker import BallPhysicsTracker, BallTrajectoryReconstructor
 from src.renderer import Tactical2DRenderer
+from src.video_reader import ThreadedVideoReader
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
@@ -283,20 +284,17 @@ class Soccer2DTrackingPipeline:
         # =====================================================================
         # PASADA 1: Inferencia Frame a Frame + Kalman 2D + Equipo + Dorsal OCR
         # =====================================================================
-        print("▶ [PASADA 1/2] Inferencia Frame a Frame + Homografía 2D + Kalman 2D + OCR...")
+        print("▶ [PASADA 1/2] Inferencia Frame a Frame + Homografía 2D + Kalman 2D + OCR (Asíncrono)...")
         frame_cache_meta: Dict[int, Dict[str, Any]] = {}
-        frame_idx = 0
         t_pass1 = time.time()
+        last_log_t = time.time()
+        frame_idx = 0
+
+        # Lector asíncrono con buffer multihilo (elimina cuello de botella de lectura en disco/CPU)
+        reader = ThreadedVideoReader(in_path, queue_size=64, max_frames=max_frames)
 
         try:
-            while cap.isOpened():
-                ret, frame_bgr = cap.read()
-                if not ret or frame_bgr is None:
-                    break
-                if max_frames and frame_idx >= max_frames:
-                    break
-
-                frame_idx += 1
+            for frame_idx, frame_bgr in reader:
                 step = self.infer_single_frame_pass1(
                     frame_bgr, frame_idx=frame_idx, fps=fps, is_video=True
                 )
@@ -316,7 +314,7 @@ class Soccer2DTrackingPipeline:
                         flush=True,
                     )
         finally:
-            cap.release()
+            reader.release()
             print()
 
         # =====================================================================
@@ -358,7 +356,7 @@ class Soccer2DTrackingPipeline:
 
         # Renderizado del video final con los IDs globales cosidos y la traza continua del balón
         print("▶ Renderizando video final con trayectorias 2D cosidas y traza continua de balón...")
-        cap2 = cv2.VideoCapture(str(in_path))
+        reader_render = ThreadedVideoReader(in_path, queue_size=64, max_frames=frame_idx)
         writer = None
         render_idx = 0
         self.renderer.reset_trails()
@@ -366,12 +364,7 @@ class Soccer2DTrackingPipeline:
         t_rend = time.time()
 
         try:
-            while cap2.isOpened() and render_idx < frame_idx:
-                ret, frame_bgr = cap2.read()
-                if not ret or frame_bgr is None:
-                    break
-
-                render_idx += 1
+            for render_idx, frame_bgr in reader_render:
                 meta = frame_cache_meta.get(render_idx)
                 if meta is None:
                     continue
@@ -399,7 +392,7 @@ class Soccer2DTrackingPipeline:
                     pct = (render_idx / max(1, frame_idx)) * 100.0
                     print(f"\r   [Render 2D] {render_idx}/{frame_idx} ({pct:5.1f}%)", end="", flush=True)
         finally:
-            cap2.release()
+            reader_render.release()
             if writer is not None:
                 writer.release()
             print()
