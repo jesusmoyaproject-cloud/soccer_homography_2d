@@ -1,0 +1,19 @@
+# configs/botsort_sports.yaml
+# Configuración de BoT-SORT optimizada para cámaras de transmisión de fútbol (paneos rápidos y oclusiones)
+
+tracker_type: botsort
+track_high_thresh: 0.45
+track_low_thresh: 0.15
+new_track_thresh: 0.55
+track_buffer: 60
+match_thresh: 0.85
+fuse_score: true
+
+# Compensación de movimiento global de cámara (GMC)
+gmc_method: sparseOptFlow
+
+# Umbrales de ReID / proximidad espacial
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+with_reid: false
+

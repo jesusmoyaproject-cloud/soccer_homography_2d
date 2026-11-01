@@ -1,0 +1,92 @@
+# configs/config.yaml
+# Configuración central para detección de Jugadores, Balón y Homografía 2D (MAGSAC++)
+
+device: "auto"  # "auto" detecta GPU CUDA si está disponible, o usa "cpu"
+half: true      # FP16 en GPU CUDA
+
+# Rutas a los modelos .pt albergados en la carpeta models/
+models:
+  player: "models/modelPlayer.pt"
+  ball: "models/modelBall.pt"
+  keypoints: "models/modelKeypoint.pt"
+
+# Umbrales de confianza solicitados
+detection:
+  conf_player: 0.50       # Confianza requerida para jugador: 0.5
+  conf_ball: 0.40         # Confianza requerida para balón: 0.4
+  conf_keypoint: 0.35     # Confianza mínima para los 30 keypoints de cancha
+  player_classes: [1, 2, 3]  # 1: Goalkeeper, 2: Player, 3: Referee (0: Ball en modelo general)
+  tracker_config: "configs/botsort_sports.yaml"
+  class_names:
+    0: "Ball"
+    1: "GK"
+    2: "Player"
+    3: "Referee"
+
+# Dimensiones oficiales de la cancha en metros (FIFA)
+pitch:
+  largo_cancha: 105.0
+  ancho_cancha: 68.0
+
+# Configuración de Homografía (MAGSAC++), Estabilización Anti-Parpadeo y Detección de Tomas Cerradas
+homography:
+  algorithm: "MAGSAC++"          # Usa cv2.USAC_MAGSAC
+  ransac_reproj_threshold: 1.5   # Umbral en metros para MAGSAC++
+  ema_alpha: 0.40                # Suavizado temporal en espacio de puntos de control
+
+  # Selección del método anti-parpadeo y anti-deformación a probar:
+  # Opciones: "method_1" (Ventana de Proximidad en Píxeles)
+  #           "method_2" (Proximidad por Proyección Inversa con M_anterior)
+  #           "both"     (Combina Método 1 + Método 2 secuencialmente)
+  #           "none"     (Sin filtro de proximidad temporal)
+  stabilization_method: "both"
+  enable_camera_pan_compensation: true  # Compensa el paneo global de cámara antes de evaluar la ventana de 10px
+
+  # Método 1: La Ventana de Proximidad en Píxeles
+  method_1_pixel_window:
+    enabled: true
+    tolerance_radius_px: 10.0          # Radio de tolerancia en píxeles (ej. 10 px alrededor de N-1 compensado)
+    out_of_window_mode: "clamp_border" # "keep_previous" (mantiene píxel N-1) o "clamp_border" (borde de ventana)
+
+  # Método 2: Proximidad por Proyección Inversa (usando M_anterior^-1)
+  method_2_inverse_projection:
+    enabled: true
+    yolo_weight: 0.25                  # Peso dado a YOLO frente a la predicción matemática (ej: pred=300, yolo=292 -> 298)
+    max_error_px: 35.0                 # Si el salto supera este umbral, se rechaza el ruido y predomina M_anterior^-1
+
+  # Detección de Tomas Cerradas y Cortes de Edición (3 Métodos de Seguridad)
+  closeup_detection:
+    # Método 1: El "Interruptor" por Pérdida de Proximidad
+    method_1_proximity_switch:
+      enabled: true
+      violation_ratio_threshold: 0.80  # Si >= 80% de los puntos violan la ventana a la vez -> cambio de toma
+      jump_distance_px: 45.0           # Salto drástico simultáneo en píxeles que denota cambio de cámara
+      min_shared_points: 3             # Mínimo de puntos compartidos para evaluar el porcentaje de salto
+
+    # Método 2: Detección de Histogramas de Color (Cortes de Edición)
+    method_2_color_histogram:
+      enabled: true
+      bhattacharyya_threshold: 0.32    # Diferencia de histograma HSV entre cuadro N-1 y N para detectar corte limpio
+      min_green_ratio: 0.12            # Proporción mínima de césped verde para considerar toma de cancha abierta
+
+    # Método 3: Validación Geométrica de la Cancha (Filtro de Seguridad MAGSAC++/RANSAC)
+    method_3_geometric_validation:
+      enabled: true
+      min_inliers: 4                   # Mínimo absoluto de inliers requeridos para formar homografía
+      min_inlier_ratio: 0.50           # Ej: si detecta 8 puntos y MAGSAC++ descarta 5 (3/8 = 37.5% < 50%) -> Bandera Roja
+      max_reproj_error_px: 16.0        # Error medio máximo de reproyección inversa en píxeles
+      max_point_error_px: 32.0         # Error individual máximo permitido en píxeles para un inlier
+      max_condition_number: 5000000.0  # Límite de número de condición para evitar matrices deformadas o singulares
+      enable_topological_filter: true  # Descarta keypoints invertidos (ej. swaps en círculo central 14/16/17/19)
+
+# Configuración de Visualización, Video y Plano 2D
+video:
+  max_frames: 3000               # Restricción por defecto a 3000 frames al procesar video
+
+visualization:
+  minimap_scale: 7.0             # Píxeles por metro en el plano 2D
+  minimap_padding_m: 5.0         # Margen exterior en metros alrededor de la cancha 2D
+  trail_length: 35               # Cantidad de fotogramas de estela de movimiento en el plano 2D
+  draw_projected_lines: true     # Proyectar líneas de cancha 2D sobre el video/imagen original
+  draw_keypoints: true           # Dibujar los keypoints detectados con su ID y conf
+  output_dir: "outputs"
