@@ -92,7 +92,7 @@ tracking_2d:
     lock_votes: 8                # Votos necesarios para bloquear el equipo de un track_id
 
   jersey_ocr:
-    enabled: true                # Lectura oportunista de dorsales con EasyOCR
+    enabled: false               # Desactivado por defecto para maximizar FPS (activar con true si se requieren dorsales)
     min_bbox_height_px: 60       # Solo evaluar cuando el jugador esté suficientemente grande/nítido
     min_ocr_conf: 0.45           # Confianza mínima de EasyOCR por lectura
     ocr_interval_frames: 10      # Intervalo de cuadros entre lecturas para un mismo track_id (optimizado)

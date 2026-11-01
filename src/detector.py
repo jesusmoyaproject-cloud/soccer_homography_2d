@@ -200,7 +200,7 @@ class SoccerInferenceEngine:
             foot_y = y2
             det_id = int(track_ids[idx]) if track_ids is not None else (idx + 1)
             role = self.class_names.get(int(cls_id), self.class_names.get(str(cls_id), f"Cls{cls_id}"))
-            color_bgr = (0, 215, 255) if int(cls_id) == 3 else extract_jersey_bgr(frame_bgr, [x1, y1, x2, y2])
+            color_bgr = (0, 215, 255) if int(cls_id) == 3 else (255, 190, 0)
 
             players.append({
                 "id": det_id,
