@@ -124,10 +124,12 @@ class SoccerInferenceEngine:
         cand = PROJECT_ROOT / p
         if cand.exists():
             return cand
-        raise FileNotFoundError(f"Modelo .pt no encontrado en: {cand}")
+        raise FileNotFoundError(f"Modelo (.pt/.engine) no encontrado en: {cand}")
 
     def _load_model(self, path: Path, task: str) -> YOLO:
         model = YOLO(str(path), task=task)
+        # Solo aplicar .to(device) si es formato PyTorch (.pt);
+        # los motores TensorRT (.engine) manejan internamente los buffers en CUDA.
         if path.suffix.lower() == ".pt" and "cuda" in self.device:
             try:
                 model.to(self.device)

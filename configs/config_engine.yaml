@@ -1,0 +1,144 @@
+# configs/config_engine.yaml
+# Configuración optimizada con TensorRT (.engine) para Google Colab con GPU CUDA
+# Lee los motores .engine desde la carpeta models/ (ej. models/modelPlayer.engine)
+
+device: "cuda:0"  # TensorRT requiere GPU CUDA
+half: true        # FP16 nativo en motores TensorRT
+
+# Rutas a los modelos TensorRT (.engine) en la carpeta models/
+models:
+  player: "models/modelPlayer.engine"
+  ball: "models/modelBall.engine"
+  keypoints: "models/modelKeypoint.engine"
+
+# Umbrales de confianza solicitados
+detection:
+  conf_player: 0.50       # Confianza requerida para jugador: 0.5
+  conf_ball: 0.40         # Confianza requerida para balón: 0.4
+  conf_keypoint: 0.35     # Confianza mínima para los 30 keypoints de cancha
+  player_classes: [1, 2, 3]  # 1: Goalkeeper, 2: Player, 3: Referee (0: Ball en modelo general)
+  tracker_config: "configs/botsort_sports.yaml"
+  class_names:
+    0: "Ball"
+    1: "GK"
+    2: "Player"
+    3: "Referee"
+
+# Dimensiones oficiales de la cancha en metros (FIFA)
+pitch:
+  largo_cancha: 105.0
+  ancho_cancha: 68.0
+
+# Configuración de Homografía (MAGSAC++), Estabilización Anti-Parpadeo y Detección de Tomas Cerradas
+homography:
+  algorithm: "MAGSAC++"          # Usa cv2.USAC_MAGSAC
+  ransac_reproj_threshold: 1.5   # Umbral en metros para MAGSAC++
+  ema_alpha: 0.40                # Suavizado temporal en espacio de puntos de control
+
+  # Selección del método anti-parpadeo y anti-deformación a probar:
+  # Opciones: "method_1" (Ventana de Proximidad en Píxeles)
+  #           "method_2" (Proximidad por Proyección Inversa con M_anterior)
+  #           "both"     (Combina Método 1 + Método 2 secuencialmente)
+  #           "none"     (Sin filtro de proximidad temporal)
+  stabilization_method: "both"
+  enable_camera_pan_compensation: true  # Compensa el paneo global de cámara antes de evaluar la ventana de 10px
+
+  # Método 1: La Ventana de Proximidad en Píxeles
+  method_1_pixel_window:
+    enabled: true
+    tolerance_radius_px: 10.0          # Radio de tolerancia en píxeles (ej. 10 px alrededor de N-1 compensado)
+    out_of_window_mode: "clamp_border" # "keep_previous" (mantiene píxel N-1) o "clamp_border" (borde de ventana)
+
+  # Método 2: Proximidad por Proyección Inversa (usando M_anterior^-1)
+  method_2_inverse_projection:
+    enabled: true
+    yolo_weight: 0.25                  # Peso dado a YOLO frente a la predicción matemática (ej: pred=300, yolo=292 -> 298)
+    max_error_px: 35.0                 # Si el salto supera este umbral, se rechaza el ruido y predomina M_anterior^-1
+
+  # Detección de Tomas Cerradas y Cortes de Edición (3 Métodos de Seguridad)
+  closeup_detection:
+    # Método 1: El "Interruptor" por Pérdida de Proximidad
+    method_1_proximity_switch:
+      enabled: true
+      violation_ratio_threshold: 0.80  # Si >= 80% de los puntos violan la ventana a la vez -> cambio de toma
+      jump_distance_px: 45.0           # Salto drástico simultáneo en píxeles que denota cambio de cámara
+      min_shared_points: 3             # Mínimo de puntos compartidos para evaluar el porcentaje de salto
+
+    # Método 2: Detección de Histogramas de Color (Cortes de Edición)
+    method_2_color_histogram:
+      enabled: true
+      bhattacharyya_threshold: 0.32    # Diferencia de histograma HSV entre cuadro N-1 y N para detectar corte limpio
+      min_green_ratio: 0.12            # Proporción mínima de césped verde para considerar toma de cancha abierta
+
+    # Método 3: Validación Geométrica de la Cancha (Filtro de Seguridad MAGSAC++/RANSAC)
+    method_3_geometric_validation:
+      enabled: true
+      min_inliers: 4                   # Mínimo absoluto de inliers requeridos para formar homografía
+      min_inlier_ratio: 0.50           # Ej: si detecta 8 puntos y MAGSAC++ descarta 5 (3/8 = 37.5% < 50%) -> Bandera Roja
+      max_reproj_error_px: 16.0        # Error medio máximo de reproyección inversa en píxeles
+      max_point_error_px: 32.0         # Error individual máximo permitido en píxeles para un inlier
+      max_condition_number: 5000000.0  # Límite de número de condición para evitar matrices deformadas o singulares
+      enable_topological_filter: true  # Descarta keypoints invertidos (ej. swaps en círculo central 14/16/17/19)
+
+# Configuración de Seguimiento 2D, Reconocimiento de Jugador y Cosido Global (2 Pasadas)
+tracking_2d:
+  enable_two_pass: true          # Ejecuta Pasada 1 (Online 2D + OCR) + Pasada 2 (Global Tracklet Stitching)
+  max_speed_mps: 12.0            # Velocidad máxima física humana en cancha (m/s)
+  reconnect_radius_m: 3.8        # Radio base en metros para reconexión inmediata en Kalman 2D
+  memory_frames: 45              # Cuadros de memoria en el filtro de Kalman 2D
+
+  team_filter:
+    min_samples_to_fit: 12       # Muestras mínimas para calibrar los 2 clusters CIE-LAB de equipo
+    lock_votes: 8                # Votos necesarios para bloquear el equipo de un track_id
+
+  jersey_ocr:
+    enabled: true                # Lectura oportunista de dorsales con EasyOCR
+    min_bbox_height_px: 52       # Altura mínima en píxeles para intentar leer el dorsal
+    min_ocr_conf: 0.45           # Confianza mínima de EasyOCR por lectura
+    ocr_interval_frames: 5       # Intervalo de cuadros entre lecturas para un mismo track_id
+    lock_confidence_sum: 1.8     # Suma de confianza acumulada para dar por confirmado el dorsal
+    max_crops_per_frame: 3       # Máximo de recortes evaluados por cuadro para mantener altos FPS
+
+  stitching:
+    max_speed_mps: 12.0          # Límite cinemático para unir fragmentos en la Pasada 2
+    max_stitch_gap_sec: 10.0     # Ventana máxima de tiempo (segundos) para coser fragmentos sin dorsal
+    max_stitch_dist_m: 18.0      # Distancia máxima en metros permitida entre fragmentos cosidos
+    min_jersey_conf_sum: 0.50    # Umbral de confianza acumulada para propagar el dorsal a todo el tracklet
+    interpolate_max_gap_frames: 12 # Hueco máximo de cuadros a interpolar en el plano 2D
+
+# Configuración Avanzada de Seguimiento y Reconstrucción del Balón (Pasada 1 + Pasada 2)
+ball_tracking:
+  conf_low_threshold: 0.15       # Recolección de candidatos con umbral bajo (conf >= 0.15)
+  conf_high_threshold: 0.40      # Umbral alto para enganche directo en estado LOST
+  enable_dynamic_roi: true       # Zoom Inteligente (ROI Dinámico 1:1 + Fallback Full Frame)
+  roi_size_locked_px: 512        # Tamaño de ventana ROI en estado LOCKED
+  roi_size_coasting_px: 640      # Tamaño de ventana ROI en estado COASTING / OCCLUDED
+  likelihood_weight_conf: 0.45   # Peso de confianza YOLO en verosimilitud
+  likelihood_weight_spatial: 0.55 # Peso de proximidad gaussiana a la predicción Kalman
+  base_gate_sigma_px: 65.0       # Apertura espacial base en píxeles
+  gate_expansion_per_frame_px: 28.0
+  min_likelihood_score: 0.30     # Puntaje mínimo de verosimilitud para aceptar candidato
+  max_ball_speed_mps: 38.0       # Velocidad física máxima de balón (~136 km/h)
+  max_jump_px_per_frame: 145.0   # Salto máximo por cuadro en píxeles
+  max_coasting_frames: 15        # Cuadros máximos en vuelo inercial (COASTING)
+  max_occlusion_frames: 28       # Cuadros máximos anclado a jugador (OCCLUDED_BY_PLAYER)
+  player_occlusion_radius_m: 1.65 # Radio en metros al pie del jugador para declarar oclusión/posesión
+  player_occlusion_radius_px: 58.0
+
+  reconstruction:
+    max_ball_speed_mps: 38.0     # Filtro anti-picos (Spike Removal) en Pasada 2
+    max_spike_jump_px: 160.0
+    max_interp_gap_frames: 35    # Hueco máximo a reconstruir a traza continua (sin corte de cámara)
+    enable_smoothing: true       # Suavizado preservador de rebotes y pases
+
+# Configuración de Visualización, Video y Plano 2D
+video:
+  max_frames: 3000               # Restricción por defecto a 3000 frames al procesar video
+
+visualization:
+  minimap_scale: 7.0             # Píxeles por metro en el plano 2D
+  minimap_padding_m: 5.0         # Margen exterior en metros alrededor de la cancha 2D
+  trail_length: 35               # Cantidad de fotogramas de estela de movimiento en el plano 2D
+  draw_projected_lines: true     # Proyectar líneas de cancha 2D sobre el video/imagen original
+  draw_keypoints: true           # Dibujar los keypoints detectados con su ID y conf
+  output_dir: "outputs"
