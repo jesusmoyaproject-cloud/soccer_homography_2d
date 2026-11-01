@@ -16,3 +16,4 @@ pyyaml>=6.0
 
 # Pruebas Unitarias y Validación
 pytest>=7.0.0
+
