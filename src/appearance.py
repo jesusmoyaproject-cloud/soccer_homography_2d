@@ -364,3 +364,4 @@ class JerseyNumberRecognizer:
             return None
         best_num, best_val = max(scores.items(), key=lambda kv: kv[1])
         return best_num if best_val >= self.min_conf else None
+

@@ -28,6 +28,7 @@ from src.homography import (
 )
 from src.tracker_2d import PitchBoTSORT2D
 from src.tracklet_stitcher import GlobalTrackletStitcher
+from src.ball_tracker import BallPhysicsTracker, BallTrajectoryReconstructor, BallState
 
 
 def test_kp_map_and_pitch_coords():
@@ -292,4 +293,106 @@ def test_pass1_kalman_2d_and_pass2_global_tracklet_stitching():
     assert frame_1_player["jersey_number"] == "9"
     assert frame_20_players[1]["jersey_number"] == "9"
     assert frame_20_players[2]["team_id"] == 2
+
+
+def test_ball_spatial_likelihood_dynamic_roi_fsm_and_reconstruction():
+    """
+    Verifica los 4 pilares del seguimiento de balón:
+    1. Selector por Verosimilitud Espacial (conf >= 0.15 prefiere candidato cercano al Kalman frente a FP lejano con mayor conf).
+    2. ROI Dinámico (512x512 en LOCKED, 640x640 en COASTING/OCCLUDED, None en LOST).
+    3. Máquina de Estados (LOCKED -> OCCLUDED_BY_PLAYER -> LOCKED).
+    4. Reconstrucción Post-Inferencia (Spike Removal + Interpolación de Huecos a Traza Continua).
+    """
+    bt = BallPhysicsTracker()
+    fps = 25.0
+    H_ident = np.array([[0.05, 0.0, 10.0], [0.0, 0.05, 5.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+    # En LOST: sin ROI dinámico
+    assert bt.state == BallState.LOST
+    assert bt.get_dynamic_roi(1920, 1080) is None
+
+    # Frame 1: Detección inicial clara (conf = 0.72) -> Pasa a LOCKED
+    c1 = [{"id": 1, "class_id": 0, "role": "Ball", "conf": 0.72, "bbox": [492, 392, 508, 408], "center_px": (500.0, 400.0), "pitch_m": None}]
+    b1 = bt.update(frame_idx=1, fps=fps, candidates=c1, players=[], homography_H=H_ident, homography_valid=True)
+    assert b1 is not None
+    assert bt.state == BallState.LOCKED
+
+    # En LOCKED: el ROI dinámico debe ser de 512x512 alrededor de (500, 400)
+    roi_locked = bt.get_dynamic_roi(1920, 1080)
+    assert roi_locked is not None
+    assert (roi_locked[2] - roi_locked[0]) == 512
+
+    # Frame 2: El balón real tiene motion blur (conf = 0.21 en (512, 402)), mientras que en la tribuna/media lejana
+    # aparece un falso positivo con conf = 0.62 en (1400, 150). El selector espacial debe elegir el balón real (0.21).
+    c2 = [
+        {"id": 1, "class_id": 0, "role": "Ball", "conf": 0.62, "bbox": [1392, 142, 1408, 158], "center_px": (1400.0, 150.0), "pitch_m": None},
+        {"id": 2, "class_id": 0, "role": "Ball", "conf": 0.21, "bbox": [504, 394, 520, 410], "center_px": (512.0, 402.0), "pitch_m": None},
+    ]
+    b2 = bt.update(frame_idx=2, fps=fps, candidates=c2, players=[], homography_H=H_ident, homography_valid=True)
+    assert b2 is not None
+    assert abs(b2["center_px"][0] - 512.0) < 10.0
+
+    # Frame 3 y 4: El balón queda oculto detrás de los pies del jugador ID=7 en (520, 404) -> OCCLUDED_BY_PLAYER
+    player_7 = [{"id": 7, "role": "Player", "foot_px": (520.0, 404.0), "pitch_m": (36.0, 25.2)}]
+    b3 = bt.update(frame_idx=3, fps=fps, candidates=[], players=player_7, homography_H=H_ident, homography_valid=True)
+    b4 = bt.update(frame_idx=4, fps=fps, candidates=[], players=player_7, homography_H=H_ident, homography_valid=True)
+    assert bt.state == BallState.OCCLUDED_BY_PLAYER
+    assert bt.carrier_player_id == 7
+    assert b3 is not None and b4 is not None
+
+    # Frame 5: El balón sale del pie del jugador y vuelve a detectarse en (545, 408) -> vuelve a LOCKED
+    c5 = [{"id": 1, "class_id": 0, "role": "Ball", "conf": 0.68, "bbox": [537, 400, 553, 416], "center_px": (545.0, 408.0), "pitch_m": None}]
+    b5 = bt.update(frame_idx=5, fps=fps, candidates=c5, players=player_7, homography_H=H_ident, homography_valid=True)
+    assert bt.state == BallState.LOCKED
+    assert b5 is not None
+
+    # Probar Reconstrucción Post-Inferencia (Pasada 2):
+    # Inyectar un pico espurio imposible en el frame 6 y una detección limpia en el frame 7
+    bt.tabular_records.append({
+        "frame": 6,
+        "detected": True,
+        "state": "LOCKED",
+        "conf": 0.50,
+        "likelihood": 0.50,
+        "center_px_x": 1500.0,  # Salto espurio de ~950 px en 1 frame
+        "center_px_y": 900.0,
+        "bbox_w": 16.0,
+        "bbox_h": 16.0,
+        "pitch_x_m": 85.0,
+        "pitch_y_m": 50.0,
+        "speed_mps": 45.0,
+        "carrier_id": None,
+        "roi_used": False,
+        "homography_valid": True,
+        "shot_cut": False,
+        "is_interpolated": False,
+    })
+    bt.tabular_records.append({
+        "frame": 7,
+        "detected": True,
+        "state": "LOCKED",
+        "conf": 0.75,
+        "likelihood": 0.80,
+        "center_px_x": 575.0,
+        "center_px_y": 412.0,
+        "bbox_w": 16.0,
+        "bbox_h": 16.0,
+        "pitch_x_m": 38.75,
+        "pitch_y_m": 25.6,
+        "speed_mps": 12.0,
+        "carrier_id": None,
+        "roi_used": True,
+        "homography_valid": True,
+        "shot_cut": False,
+        "is_interpolated": False,
+    })
+
+    reconstructor = BallTrajectoryReconstructor(fps=fps)
+    recon_rows, stats = reconstructor.reconstruct(bt.tabular_records)
+    assert stats["spikes_removed"] == 1
+    assert stats["active_ball_frames"] == 7
+    lookup = reconstructor.build_frame_lookup(recon_rows)
+    # El frame 6 (antes pico en 1500.0) ahora debe estar interpolado suavemente cerca de ~560 px
+    assert 540.0 <= lookup[6][0]["center_px"][0] <= 580.0
+
 

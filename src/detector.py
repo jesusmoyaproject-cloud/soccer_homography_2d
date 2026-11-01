@@ -259,6 +259,59 @@ class SoccerInferenceEngine:
 
         return balls
 
+    def infer_ball_candidates(
+        self,
+        frame_bgr: np.ndarray,
+        conf_low: float = 0.15,
+        roi_box: Optional[Tuple[int, int, int, int]] = None,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """
+        Estrategia de Inferencia de Balón: ROI Dinámico (Zoom Inteligente) + Full Frame Fallback
+        recolectando todos los candidatos desde `conf >= 0.15`.
+        Retorna: (lista_candidatos, se_uso_roi)
+        """
+        if roi_box is not None:
+            rx1, ry1, rx2, ry2 = roi_box
+            crop = frame_bgr[ry1:ry2, rx1:rx2]
+            if crop.size > 0:
+                res_roi = self.ball_model.predict(
+                    source=crop,
+                    conf=float(conf_low),
+                    device=self.device,
+                    half=self.half,
+                    verbose=False,
+                )[0]
+                if res_roi.boxes is not None and len(res_roi.boxes) > 0:
+                    boxes = res_roi.boxes.xyxy.cpu().numpy()
+                    confs = res_roi.boxes.conf.cpu().numpy()
+                    classes = res_roi.boxes.cls.cpu().numpy().astype(int)
+                    order = np.argsort(-confs)
+                    roi_cands: List[Dict[str, Any]] = []
+                    for rank, idx in enumerate(order):
+                        score = float(confs[idx])
+                        if score < conf_low:
+                            continue
+                        x1, y1, x2, y2 = [float(v) for v in boxes[idx]]
+                        gx1, gy1, gx2, gy2 = x1 + rx1, y1 + ry1, x2 + rx1, y2 + ry1
+                        roi_cands.append({
+                            "id": rank + 1,
+                            "class_id": int(classes[idx]),
+                            "role": "Ball",
+                            "conf": score,
+                            "bbox": [gx1, gy1, gx2, gy2],
+                            "center_px": ((gx1 + gx2) / 2.0, (gy1 + gy2) / 2.0),
+                            "pitch_m": None,
+                            "from_roi": True,
+                        })
+                    if roi_cands:
+                        return roi_cands, True
+
+        # Fallback a Full Frame si no había ROI o el ROI no devolvió candidatos
+        full_cands = self.infer_ball(frame_bgr, conf=conf_low)
+        for c in full_cands:
+            c["from_roi"] = False
+        return full_cands, False
+
     def infer_keypoints(
         self,
         frame_bgr: np.ndarray,

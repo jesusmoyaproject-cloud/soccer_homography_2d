@@ -105,6 +105,31 @@ tracking_2d:
     min_jersey_conf_sum: 0.50    # Umbral de confianza acumulada para propagar el dorsal a todo el tracklet
     interpolate_max_gap_frames: 12 # Hueco máximo de cuadros a interpolar en el plano 2D
 
+# Configuración Avanzada de Seguimiento y Reconstrucción del Balón (Pasada 1 + Pasada 2)
+ball_tracking:
+  conf_low_threshold: 0.15       # Recolección de candidatos con umbral bajo (conf >= 0.15)
+  conf_high_threshold: 0.40      # Umbral alto para enganche directo en estado LOST
+  enable_dynamic_roi: true       # Zoom Inteligente (ROI Dinámico 1:1 + Fallback Full Frame)
+  roi_size_locked_px: 512        # Tamaño de ventana ROI en estado LOCKED
+  roi_size_coasting_px: 640      # Tamaño de ventana ROI en estado COASTING / OCCLUDED
+  likelihood_weight_conf: 0.45   # Peso de confianza YOLO en verosimilitud
+  likelihood_weight_spatial: 0.55 # Peso de proximidad gaussiana a la predicción Kalman
+  base_gate_sigma_px: 65.0       # Apertura espacial base en píxeles
+  gate_expansion_per_frame_px: 28.0
+  min_likelihood_score: 0.30     # Puntaje mínimo de verosimilitud para aceptar candidato
+  max_ball_speed_mps: 38.0       # Velocidad física máxima de balón (~136 km/h)
+  max_jump_px_per_frame: 145.0   # Salto máximo por cuadro en píxeles
+  max_coasting_frames: 15        # Cuadros máximos en vuelo inercial (COASTING)
+  max_occlusion_frames: 28       # Cuadros máximos anclado a jugador (OCCLUDED_BY_PLAYER)
+  player_occlusion_radius_m: 1.65 # Radio en metros al pie del jugador para declarar oclusión/posesión
+  player_occlusion_radius_px: 58.0
+
+  reconstruction:
+    max_ball_speed_mps: 38.0     # Filtro anti-picos (Spike Removal) en Pasada 2
+    max_spike_jump_px: 160.0
+    max_interp_gap_frames: 35    # Hueco máximo a reconstruir a traza continua (sin corte de cámara)
+    enable_smoothing: true       # Suavizado preservador de rebotes y pases
+
 # Configuración de Visualización, Video y Plano 2D
 video:
   max_frames: 3000               # Restricción por defecto a 3000 frames al procesar video

@@ -361,3 +361,4 @@ class PitchBoTSORT2D:
             )
 
         return players
+

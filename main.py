@@ -27,6 +27,7 @@ from src.homography import HomographyStabilizer, pixel_to_pitch
 from src.appearance import TeamClusterer, JerseyNumberRecognizer
 from src.tracker_2d import PitchBoTSORT2D
 from src.tracklet_stitcher import GlobalTrackletStitcher
+from src.ball_tracker import BallPhysicsTracker, BallTrajectoryReconstructor
 from src.renderer import Tactical2DRenderer
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
@@ -79,6 +80,7 @@ class Soccer2DTrackingPipeline:
             use_gpu=("cuda" in str(self.detector.device).lower()),
         )
         self.tracker_2d = PitchBoTSORT2D(config=self.config)
+        self.ball_tracker = BallPhysicsTracker(config=self.config)
         self.renderer = Tactical2DRenderer(config=self.config)
 
     def _reset_all_states(self) -> None:
@@ -86,6 +88,7 @@ class Soccer2DTrackingPipeline:
         self.team_clusterer.reset()
         self.jersey_recognizer.reset()
         self.tracker_2d.reset()
+        self.ball_tracker.reset()
         self.renderer.reset_trails()
 
     def infer_single_frame_pass1(
@@ -97,11 +100,13 @@ class Soccer2DTrackingPipeline:
     ) -> Dict[str, Any]:
         """
         Ejecuta la Pasada 1 sobre un fotograma:
-        Inferencia YOLO + Homografía MAGSAC++ + Equipo CIE-LAB + EasyOCR + Kalman 2D.
+        Inferencia YOLO + ROI Dinámico de Balón (conf>=0.15) + Homografía MAGSAC++
+        + Equipo CIE-LAB + EasyOCR + Kalman 2D (Jugadores) + Máquina de Estados (Balón).
         """
-        # 1. Inferencia de Jugadores (conf = 0.5) y Balón (conf = 0.4)
+        h_img, w_img = frame_bgr.shape[:2]
+
+        # 1. Inferencia de Jugadores (conf = 0.5)
         players = self.detector.infer_players(frame_bgr, is_video=is_video)
-        balls = self.detector.infer_ball(frame_bgr)
 
         # 2. Inferencia de los 30 Keypoints (excluyendo cajas de jugadores)
         player_boxes = [p["bbox"] for p in players]
@@ -109,22 +114,19 @@ class Soccer2DTrackingPipeline:
 
         # 3. Homografía 2D con MAGSAC++ y validación geométrica/topológica
         homog_res = self.stabilizer.process_frame(frame_bgr, raw_kps, is_video=is_video)
+        shot_cut = bool(homog_res.shot_cut_histogram or homog_res.proximity_switch_triggered)
 
-        # 4. Proyectar posiciones crudas de pies y balón a coordenadas 2D de cancha (metros)
+        # 4. Proyectar posiciones crudas de pies de jugadores a coordenadas 2D de cancha (metros)
         if homog_res.is_valid and homog_res.H is not None:
             for p in players:
                 fx, fy = p["foot_px"]
                 p["pitch_m"] = pixel_to_pitch(fx, fy, homog_res.H)
-            for b in balls:
-                bx, by = b["center_px"]
-                b["pitch_m"] = pixel_to_pitch(bx, by, homog_res.H)
 
         # 5. Clasificación de Equipo (CIE-LAB sin césped) y Lectura Oportunista de Dorsal (EasyOCR)
         self.team_clusterer.classify_players(frame_bgr, players)
         self.jersey_recognizer.recognize_frame_jerseys(frame_bgr, players, frame_idx=frame_idx)
 
         # 6. BoT-SORT modificado con Filtro de Kalman 2D en cancha y registro tabular
-        shot_cut = bool(homog_res.shot_cut_histogram or homog_res.proximity_switch_triggered)
         if is_video:
             players = self.tracker_2d.update_frame(
                 frame_idx=frame_idx,
@@ -133,6 +135,32 @@ class Soccer2DTrackingPipeline:
                 homography_valid=homog_res.is_valid,
                 shot_cut=shot_cut,
             )
+
+        # 7. Seguimiento Avanzado de Balón: ROI Dinámico + Verosimilitud (conf>=0.15) + FSM
+        if is_video:
+            roi_box = None if shot_cut else self.ball_tracker.get_dynamic_roi(w_img, h_img)
+            ball_cands, roi_used = self.detector.infer_ball_candidates(
+                frame_bgr,
+                conf_low=self.ball_tracker.conf_low,
+                roi_box=roi_box,
+            )
+            tracked_ball = self.ball_tracker.update(
+                frame_idx=frame_idx,
+                fps=fps,
+                candidates=ball_cands,
+                players=players,
+                homography_H=homog_res.H,
+                homography_valid=homog_res.is_valid,
+                shot_cut=shot_cut,
+                roi_used=roi_used,
+            )
+            balls = [tracked_ball] if tracked_ball is not None else []
+        else:
+            balls = self.detector.infer_ball(frame_bgr)
+            if homog_res.is_valid and homog_res.H is not None:
+                for b in balls:
+                    bx, by = b["center_px"]
+                    b["pitch_m"] = pixel_to_pitch(bx, by, homog_res.H)
 
         return {
             "players": players,
@@ -292,29 +320,44 @@ class Soccer2DTrackingPipeline:
             print()
 
         # =====================================================================
-        # PASADA 2: Post-procesamiento Tabular y Global Tracklet Stitching
+        # PASADA 2: Post-procesamiento Tabular (Jugadores + Reconstrucción de Balón)
         # =====================================================================
-        print("▶ [PASADA 2/2] Ejecutando Global Tracklet Stitching y propagación de dorsales...")
+        print("▶ [PASADA 2/2] Ejecutando Global Tracklet Stitching y Reconstrucción Continua del Balón...")
         t_stitch = time.time()
         stitcher = GlobalTrackletStitcher(config=self.config, fps=fps)
         raw_records = self.tracker_2d.tabular_records
         stitched_records, stitch_stats = stitcher.stitch_and_propagate(raw_records)
         stitched_by_frame = stitcher.build_frame_lookup(stitched_records)
 
+        # Reconstrucción Post-Inferencia de la Traza Continua del Balón
+        ball_reconstructor = BallTrajectoryReconstructor(config=self.config, fps=fps)
+        reconstructed_ball_rows, ball_stats = ball_reconstructor.reconstruct(
+            self.ball_tracker.tabular_records,
+            stitched_players_by_frame=stitched_by_frame,
+        )
+        reconstructed_balls_by_frame = ball_reconstructor.build_frame_lookup(reconstructed_ball_rows)
+
         raw_csv_path = out_path.with_name(f"{out_path.stem}_raw_tracks.csv")
         stitched_csv_path = out_path.with_name(f"{out_path.stem}_stitched_tracks.csv")
+        ball_csv_path = out_path.with_name(f"{out_path.stem}_ball_trajectory.csv")
         stitcher.export_to_csv(raw_records, raw_csv_path)
         stitcher.export_to_csv(stitched_records, stitched_csv_path)
+        ball_reconstructor.export_to_csv(reconstructed_ball_rows, ball_csv_path)
         stitch_elapsed = time.time() - t_stitch
 
         print(
-            f"   ✓ Cosido completado en {stitch_elapsed:.2f}s: "
+            f"   ✓ Jugadores cosidos en {stitch_elapsed:.2f}s: "
             f"{stitch_stats['raw_tracklets']} fragmentos -> {stitch_stats['stitched_players']} identidades globales "
             f"({stitch_stats['merges_performed']} uniones, {stitch_stats['jerseys_assigned']} dorsales propagados)."
         )
+        print(
+            f"   ✓ Balón reconstruido: {ball_stats['detected_frames']} detectados + "
+            f"{ball_stats['interpolated_frames']} reconstruidos = {ball_stats['active_ball_frames']}/{ball_stats['total_frames']} cuadros activos "
+            f"({ball_stats['spikes_removed']} picos espurios eliminados)."
+        )
 
-        # Renderizado del video final con los IDs globales cosidos y dorsales propagados desde el Frame 1
-        print("▶ Renderizando video final con trayectorias 2D cosidas...")
+        # Renderizado del video final con los IDs globales cosidos y la traza continua del balón
+        print("▶ Renderizando video final con trayectorias 2D cosidas y traza continua de balón...")
         cap2 = cv2.VideoCapture(str(in_path))
         writer = None
         render_idx = 0
@@ -334,14 +377,14 @@ class Soccer2DTrackingPipeline:
                     continue
 
                 players_stitched = stitched_by_frame.get(render_idx, [])
-                balls = meta["balls"]
+                balls_reconstructed = reconstructed_balls_by_frame.get(render_idx, meta["balls"])
                 homog_res = meta["homography"]
 
                 annotated_cam = self.renderer.draw_camera_annotations(
-                    frame_bgr, players_stitched, balls, homog_res, stabilization_mode=stab_mode
+                    frame_bgr, players_stitched, balls_reconstructed, homog_res, stabilization_mode=stab_mode
                 )
                 plane_2d = self.renderer.render_2d_plane(
-                    players_stitched, balls, homog_res, update_trails=True
+                    players_stitched, balls_reconstructed, homog_res, update_trails=True
                 )
                 combined = self.renderer.compose_side_by_side(annotated_cam, plane_2d)
 
@@ -367,6 +410,7 @@ class Soccer2DTrackingPipeline:
         print(f"   Video Etiquetado:   {out_path}")
         print(f"   CSV Pasada 1 Crudo: {raw_csv_path}")
         print(f"   CSV Pasada 2 Cosido:{stitched_csv_path}")
+        print(f"   CSV Traza Balón:    {ball_csv_path}")
         print(f"   Cuadros Procesados: {frame_idx} en {total_t:.1f}s")
         print("=" * 72)
         return out_path

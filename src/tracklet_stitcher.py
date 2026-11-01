@@ -502,3 +502,4 @@ class GlobalTrackletStitcher:
             writer.writeheader()
             writer.writerows(records)
         return out_path
+

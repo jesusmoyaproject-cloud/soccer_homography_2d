@@ -44,14 +44,16 @@ class Tactical2DRenderer:
         self.pitch_segments = get_pitch_line_segments(self.largo_cancha, self.ancho_cancha)
         self.base_pitch_2d, self.pad_px = self._create_2d_pitch_template()
 
-        # Historial de trayectorias 2D (en metros) para videos
+        # Historial de trayectorias 2D (en metros) y en cámara para videos
         self.player_trails_2d: Dict[int, deque] = {}
         self.ball_trail_2d: deque = deque(maxlen=self.trail_length)
+        self.ball_trail_cam: deque = deque(maxlen=20)
 
     def reset_trails(self) -> None:
         """Reinicia las estelas de movimiento 2D cuando hay cambio de toma."""
         self.player_trails_2d.clear()
         self.ball_trail_2d.clear()
+        self.ball_trail_cam.clear()
 
     def _m_to_px(self, xm: float, ym: float) -> Tuple[int, int]:
         """Convierte coordenadas en metros (0..105, 0..68) a píxeles del plano 2D."""
@@ -226,17 +228,27 @@ class Tactical2DRenderer:
             cv2.rectangle(out, (bx1, by1), (bx2, by2), col, 1, lineType=cv2.LINE_AA)
             cv2.putText(out, label, (bx1 + 4, by2 - 4), font, 0.45, (255, 255, 255), 1, lineType=cv2.LINE_AA)
 
-        # 4. Balón detectado (con ID y conf)
+        # 4. Balón detectado o reconstruido (con ID, estado, conf y estela suave)
+        if homog_res.shot_cut_histogram or homog_res.proximity_switch_triggered:
+            self.ball_trail_cam.clear()
+
         for b in balls:
             x1, y1, x2, y2 = [int(round(v)) for v in b["bbox"]]
             cx, cy = int(round(b["center_px"][0])), int(round(b["center_px"][1]))
-            b_col = (0, 140, 255)
+            is_interp = bool(b.get("is_interpolated", False))
+            b_col = (0, 200, 255) if is_interp else (0, 140, 255)
+
+            self.ball_trail_cam.append((cx, cy))
+            if len(self.ball_trail_cam) >= 2:
+                c_pts = np.array(list(self.ball_trail_cam), dtype=np.int32).reshape(-1, 1, 2)
+                cv2.polylines(out, [c_pts], isClosed=False, color=b_col, thickness=2, lineType=cv2.LINE_AA)
 
             cv2.rectangle(out, (x1, y1), (x2, y2), b_col, 2, lineType=cv2.LINE_AA)
             cv2.circle(out, (cx, cy), 6, b_col, -1, lineType=cv2.LINE_AA)
             cv2.circle(out, (cx, cy), 8, (255, 255, 255), 1, lineType=cv2.LINE_AA)
 
-            b_label = f"Ball ID:{b['id']} {b['conf']:.2f}"
+            state_tag = " [REC]" if is_interp else ""
+            b_label = f"Ball ID:{b['id']}{state_tag} {b['conf']:.2f}"
             (tw, th), _ = cv2.getTextSize(b_label, font, 0.45, 1)
             bx1 = max(2, cx - tw // 2 - 4)
             by2 = max(th + 6, y1 - 4)
