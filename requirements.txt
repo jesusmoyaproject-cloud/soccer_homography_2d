@@ -8,8 +8,9 @@ opencv-python>=4.8.0
 numpy>=1.23.0
 scipy>=1.10.0
 
-# Tracking y Asociación de Jugadores (BoT-SORT)
+# Tracking, Reconocimiento de Dorsales (OCR) y Asociación de Jugadores (BoT-SORT)
 lapx>=0.5.5
+easyocr>=1.7.0
 
 # Configuración y Utilidades
 pyyaml>=6.0

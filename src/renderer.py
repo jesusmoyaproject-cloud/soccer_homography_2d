@@ -213,7 +213,9 @@ class Tactical2DRenderer:
             axes = (max(6, int((x2 - x1) * 0.45)), max(4, int((y2 - y1) * 0.10)))
             cv2.ellipse(out, (fx, fy), axes, 0, 0, 360, col, 2, lineType=cv2.LINE_AA)
 
-            label = f"ID:{p['id']} {p['role']} {p['conf']:.2f}"
+            jersey_num = p.get("jersey_number")
+            jersey_tag = f" [#{jersey_num}]" if jersey_num else ""
+            label = f"ID:{p['id']}{jersey_tag} {p['role']} {p['conf']:.2f}"
             (tw, th), _ = cv2.getTextSize(label, font, 0.45, 1)
             bx1 = max(2, fx - tw // 2 - 4)
             by2 = max(th + 6, y1 - 3)
@@ -312,7 +314,8 @@ class Tactical2DRenderer:
             cv2.circle(plane, (px, py), 8, col, -1, lineType=cv2.LINE_AA)
             cv2.circle(plane, (px, py), 9, (15, 15, 15), 1, lineType=cv2.LINE_AA)
 
-            id_txt = str(pid)
+            jersey_num = p.get("jersey_number")
+            id_txt = f"#{jersey_num}" if jersey_num else str(pid)
             (tw, th), _ = cv2.getTextSize(id_txt, font, 0.35, 1)
             cv2.putText(
                 plane,

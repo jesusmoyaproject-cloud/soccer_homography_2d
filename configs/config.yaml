@@ -79,6 +79,32 @@ homography:
       max_condition_number: 5000000.0  # Límite de número de condición para evitar matrices deformadas o singulares
       enable_topological_filter: true  # Descarta keypoints invertidos (ej. swaps en círculo central 14/16/17/19)
 
+# Configuración de Seguimiento 2D, Reconocimiento de Jugador y Cosido Global (2 Pasadas)
+tracking_2d:
+  enable_two_pass: true          # Ejecuta Pasada 1 (Online 2D + OCR) + Pasada 2 (Global Tracklet Stitching)
+  max_speed_mps: 12.0            # Velocidad máxima física humana en cancha (m/s)
+  reconnect_radius_m: 3.8        # Radio base en metros para reconexión inmediata en Kalman 2D
+  memory_frames: 45              # Cuadros de memoria en el filtro de Kalman 2D
+
+  team_filter:
+    min_samples_to_fit: 12       # Muestras mínimas para calibrar los 2 clusters CIE-LAB de equipo
+    lock_votes: 8                # Votos necesarios para bloquear el equipo de un track_id
+
+  jersey_ocr:
+    enabled: true                # Lectura oportunista de dorsales con EasyOCR
+    min_bbox_height_px: 52       # Altura mínima en píxeles para intentar leer el dorsal
+    min_ocr_conf: 0.45           # Confianza mínima de EasyOCR por lectura
+    ocr_interval_frames: 5       # Intervalo de cuadros entre lecturas para un mismo track_id
+    lock_confidence_sum: 1.8     # Suma de confianza acumulada para dar por confirmado el dorsal
+    max_crops_per_frame: 3       # Máximo de recortes evaluados por cuadro para mantener altos FPS
+
+  stitching:
+    max_speed_mps: 12.0          # Límite cinemático para unir fragmentos en la Pasada 2
+    max_stitch_gap_sec: 10.0     # Ventana máxima de tiempo (segundos) para coser fragmentos sin dorsal
+    max_stitch_dist_m: 18.0      # Distancia máxima en metros permitida entre fragmentos cosidos
+    min_jersey_conf_sum: 0.50    # Umbral de confianza acumulada para propagar el dorsal a todo el tracklet
+    interpolate_max_gap_frames: 12 # Hueco máximo de cuadros a interpolar en el plano 2D
+
 # Configuración de Visualización, Video y Plano 2D
 video:
   max_frames: 3000               # Restricción por defecto a 3000 frames al procesar video

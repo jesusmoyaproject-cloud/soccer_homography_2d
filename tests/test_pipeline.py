@@ -26,6 +26,8 @@ from src.homography import (
     filter_topological_outliers,
     validate_projected_pitch_topology,
 )
+from src.tracker_2d import PitchBoTSORT2D
+from src.tracklet_stitcher import GlobalTrackletStitcher
 
 
 def test_kp_map_and_pitch_coords():
@@ -199,3 +201,95 @@ def test_topological_filter_and_closeup_methods():
     topo_ok, topo_reason = validate_projected_pitch_topology(H_flipped_y, H_flipped_y, inliers_sample)
     assert topo_ok is False
     assert "BANDERA ROJA" in topo_reason
+
+
+def test_pass1_kalman_2d_and_pass2_global_tracklet_stitching():
+    """
+    Verifica el flujo completo de Pasada 1 (Kalman 2D + Gating de Equipo) y
+    Pasada 2 (Propagación retroactiva de dorsal + Global Tracklet Stitching tras corte de cámara).
+    """
+    tracker_2d = PitchBoTSORT2D()
+    fps = 25.0
+
+    # Simular un jugador (raw_track_id=10, Team 1) corriendo de X=40m a X=42m entre frames 1..10
+    # El dorsal "9" recién es leído por EasyOCR en el frame 8.
+    for f in range(1, 11):
+        p = {
+            "id": 10,
+            "role": "Player",
+            "class_id": 2,
+            "conf": 0.88,
+            "bbox": [300.0, 400.0, 340.0, 490.0],
+            "foot_px": (320.0, 490.0),
+            "pitch_m": (40.0 + 0.2 * f, 30.0),
+            "team_id": 1,
+            "team_label": "Team_A",
+            "color_bgr": (255, 190, 0),
+            "lab_feature": [50.0, 120.0, 140.0],
+            "jersey_ocr_raw": "9" if f == 8 else None,
+            "jersey_ocr_conf": 0.91 if f == 8 else 0.0,
+            "jersey_number": "9" if f >= 8 else None,
+        }
+        tracker_2d.update_frame(frame_idx=f, fps=fps, players=[p], homography_valid=True, shot_cut=False)
+
+    # En el frame 15 ocurre un corte de cámara (shot_cut=True) y el mismo jugador reaparece con
+    # un nuevo raw_track_id=245 cerca de (43.5m, 30.2m), mismo equipo (Team 1), y otro rival (Team 2) cerca.
+    for f in range(15, 22):
+        p_same = {
+            "id": 245,
+            "role": "Player",
+            "class_id": 2,
+            "conf": 0.90,
+            "bbox": [350.0, 400.0, 390.0, 490.0],
+            "foot_px": (370.0, 490.0),
+            "pitch_m": (43.0 + 0.2 * (f - 15), 30.2),
+            "team_id": 1,
+            "team_label": "Team_A",
+            "color_bgr": (255, 190, 0),
+            "lab_feature": [51.0, 121.0, 139.0],
+            "jersey_ocr_raw": None,
+            "jersey_ocr_conf": 0.0,
+            "jersey_number": None,
+        }
+        p_rival = {
+            "id": 246,
+            "role": "Player",
+            "class_id": 2,
+            "conf": 0.85,
+            "bbox": [355.0, 405.0, 395.0, 495.0],
+            "foot_px": (375.0, 495.0),
+            "pitch_m": (42.8, 30.1),
+            "team_id": 2,  # Equipo rival: jamás debe coserse con raw_track_id=10
+            "team_label": "Team_B",
+            "color_bgr": (40, 50, 240),
+            "lab_feature": [50.0, 175.0, 150.0],
+            "jersey_ocr_raw": None,
+            "jersey_ocr_conf": 0.0,
+            "jersey_number": None,
+        }
+        tracker_2d.update_frame(
+            frame_idx=f,
+            fps=fps,
+            players=[p_same, p_rival],
+            homography_valid=True,
+            shot_cut=(f == 15),
+        )
+
+    # Ejecutar Pasada 2: Global Tracklet Stitching
+    stitcher = GlobalTrackletStitcher(fps=fps)
+    stitched_rows, stats = stitcher.stitch_and_propagate(tracker_2d.tabular_records)
+
+    # Verificar que raw_track_id=10 y raw_track_id=245 fueron unidos en el mismo global_track_id=1,
+    # mientras que el rival (raw_track_id=246, Team 2) recibió un global_track_id distinto (2).
+    assert stats["stitched_players"] == 2
+    assert stats["merges_performed"] == 1
+
+    by_frame = stitcher.build_frame_lookup(stitched_rows)
+    # Verificar que el dorsal "9" leído en el frame 8 se propagó retroactivamente al Frame 1 y hacia adelante al Frame 20
+    frame_1_player = by_frame[1][0]
+    frame_20_players = {p["id"]: p for p in by_frame[20]}
+    assert frame_1_player["id"] == 1
+    assert frame_1_player["jersey_number"] == "9"
+    assert frame_20_players[1]["jersey_number"] == "9"
+    assert frame_20_players[2]["team_id"] == 2
+

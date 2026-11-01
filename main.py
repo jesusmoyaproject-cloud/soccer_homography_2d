@@ -1,25 +1,20 @@
 """
-main.py — Orquestador Principal de Inferencia de Jugador, Balón y Homografía 2D (MAGSAC++).
+main.py — Orquestador Principal de Inferencia de Jugador, Balón, Homografía 2D (MAGSAC++)
+y Seguimiento/Reconocimiento en 2 Pasadas (Kalman 2D + EasyOCR + Global Tracklet Stitching).
 
 Uso por línea de comandos:
   # Procesar una imagen:
   python main.py --input ruta/a/imagen.jpg --output outputs/resultado.jpg
 
-  # Procesar un video probando Método 1 (Ventana de Proximidad en Píxeles):
-  python main.py --input ruta/a/video.mp4 --stabilization method_1
-
-  # Procesar un video probando Método 2 (Proximidad por Proyección Inversa):
-  python main.py --input ruta/a/video.mp4 --stabilization method_2
-
-  # Procesar combinando ambos métodos y los 3 filtros de tomas cerradas:
-  python main.py --input ruta/a/video.mp4 --stabilization both
+  # Procesar un video con Arquitectura de 2 Pasadas (Pasada 1 Online + Pasada 2 Cosido Global):
+  python main.py --input ruta/a/video.mp4 --stabilization both --max-frames 3000
 """
 
 import sys
 import time
 import argparse
 from pathlib import Path
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Any, List, Optional, Union
 import cv2
 import numpy as np
 
@@ -29,6 +24,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.detector import SoccerInferenceEngine, load_yaml_config
 from src.homography import HomographyStabilizer, pixel_to_pitch
+from src.appearance import TeamClusterer, JerseyNumberRecognizer
+from src.tracker_2d import PitchBoTSORT2D
+from src.tracklet_stitcher import GlobalTrackletStitcher
 from src.renderer import Tactical2DRenderer
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
@@ -37,11 +35,17 @@ VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
 
 class Soccer2DTrackingPipeline:
     """
-    Pipeline integral que ejecuta:
-      1. Detección de Jugadores (conf=0.5), Balón (conf=0.4) y 30 Keypoints desde modelos .pt.
-      2. Homografía con MAGSAC++ + Estabilización (Método 1 y Método 2) + Tomas Cerradas (Métodos 1, 2 y 3).
-      3. Proyección al plano 2D en metros (105m x 68m) de los movimientos de jugadores y balón.
-      4. Etiquetado visual con inferencias, ID detectado, conf y plano 2D.
+    Pipeline integral de 2 Pasadas:
+      - Pasada 1 (Frame a Frame):
+          1. Inferencia de Jugadores (conf=0.5), Balón (conf=0.4) y 30 Keypoints desde modelos .pt.
+          2. Homografía 2D con MAGSAC++ + Estabilización (Métodos 1 y 2) + Tomas Cerradas (Métodos 1, 2 y 3).
+          3. Clasificación de Equipo por color en espacio CIE-LAB sin césped (`TeamClusterer`).
+          4. Reconocimiento oportunista de dorsales con EasyOCR (`JerseyNumberRecognizer`).
+          5. BoT-SORT modificado con Filtro de Kalman en coordenadas 2D de cancha (`PitchBoTSORT2D`).
+      - Pasada 2 (Post-procesamiento Tabular y Global Tracklet Stitching):
+          1. Propaga los dorsales leídos a todo el tracklet.
+          2. Detecta cortes de cámara y une fragmentos rotos usando distancia 2D + tiempo + equipo + dorsal.
+          3. Renderiza el video final etiquetado con IDs globales cosidos, dorsales y el Plano 2D.
     """
 
     def __init__(
@@ -50,6 +54,7 @@ class Soccer2DTrackingPipeline:
         stabilization_override: Optional[str] = None,
         conf_player_override: Optional[float] = None,
         conf_ball_override: Optional[float] = None,
+        two_pass_override: Optional[bool] = None,
     ):
         self.config = load_yaml_config(config_path)
 
@@ -59,34 +64,53 @@ class Soccer2DTrackingPipeline:
             self.config.setdefault("detection", {})["conf_player"] = float(conf_player_override)
         if conf_ball_override is not None:
             self.config.setdefault("detection", {})["conf_ball"] = float(conf_ball_override)
+        if two_pass_override is not None:
+            self.config.setdefault("tracking_2d", {})["enable_two_pass"] = bool(two_pass_override)
+
+        self.enable_two_pass = bool(
+            self.config.get("tracking_2d", {}).get("enable_two_pass", True)
+        )
 
         self.detector = SoccerInferenceEngine(config=self.config)
         self.stabilizer = HomographyStabilizer(config=self.config)
+        self.team_clusterer = TeamClusterer(config=self.config)
+        self.jersey_recognizer = JerseyNumberRecognizer(
+            config=self.config,
+            use_gpu=("cuda" in str(self.detector.device).lower()),
+        )
+        self.tracker_2d = PitchBoTSORT2D(config=self.config)
         self.renderer = Tactical2DRenderer(config=self.config)
 
-    def process_frame_array(
+    def _reset_all_states(self) -> None:
+        self.stabilizer.reset_temporal_state()
+        self.team_clusterer.reset()
+        self.jersey_recognizer.reset()
+        self.tracker_2d.reset()
+        self.renderer.reset_trails()
+
+    def infer_single_frame_pass1(
         self,
         frame_bgr: np.ndarray,
+        frame_idx: int = 1,
+        fps: float = 25.0,
         is_video: bool = False,
     ) -> Dict[str, Any]:
         """
-        Procesa un fotograma BGR y devuelve la imagen compuesta (cámara etiquetada + plano 2D)
-        junto con los datos estructurados de las inferencias y la matriz de homografía.
+        Ejecuta la Pasada 1 sobre un fotograma:
+        Inferencia YOLO + Homografía MAGSAC++ + Equipo CIE-LAB + EasyOCR + Kalman 2D.
         """
         # 1. Inferencia de Jugadores (conf = 0.5) y Balón (conf = 0.4)
         players = self.detector.infer_players(frame_bgr, is_video=is_video)
         balls = self.detector.infer_ball(frame_bgr)
 
-        # Extraer bboxes de jugadores para filtrar keypoints falsos sobre camisetas/medias
+        # 2. Inferencia de los 30 Keypoints (excluyendo cajas de jugadores)
         player_boxes = [p["bbox"] for p in players]
-
-        # 2. Inferencia de los 30 Keypoints de Homografía
         raw_kps = self.detector.infer_keypoints(frame_bgr, exclude_player_boxes=player_boxes)
 
-        # 3. Estimación y Estabilización de Homografía con MAGSAC++
+        # 3. Homografía 2D con MAGSAC++ y validación geométrica/topológica
         homog_res = self.stabilizer.process_frame(frame_bgr, raw_kps, is_video=is_video)
 
-        # 4. Proyectar posiciones de Jugadores y Balón al Plano 2D en metros (si H es válida)
+        # 4. Proyectar posiciones crudas de pies y balón a coordenadas 2D de cancha (metros)
         if homog_res.is_valid and homog_res.H is not None:
             for p in players:
                 fx, fy = p["foot_px"]
@@ -95,7 +119,42 @@ class Soccer2DTrackingPipeline:
                 bx, by = b["center_px"]
                 b["pitch_m"] = pixel_to_pitch(bx, by, homog_res.H)
 
-        # 5. Renderizar cámara etiquetada (inferencias, ID, conf) y Plano 2D de movimientos
+        # 5. Clasificación de Equipo (CIE-LAB sin césped) y Lectura Oportunista de Dorsal (EasyOCR)
+        self.team_clusterer.classify_players(frame_bgr, players)
+        self.jersey_recognizer.recognize_frame_jerseys(frame_bgr, players, frame_idx=frame_idx)
+
+        # 6. BoT-SORT modificado con Filtro de Kalman 2D en cancha y registro tabular
+        shot_cut = bool(homog_res.shot_cut_histogram or homog_res.proximity_switch_triggered)
+        if is_video:
+            players = self.tracker_2d.update_frame(
+                frame_idx=frame_idx,
+                fps=fps,
+                players=players,
+                homography_valid=homog_res.is_valid,
+                shot_cut=shot_cut,
+            )
+
+        return {
+            "players": players,
+            "balls": balls,
+            "homography": homog_res,
+        }
+
+    def process_frame_array(
+        self,
+        frame_bgr: np.ndarray,
+        is_video: bool = False,
+        frame_idx: int = 1,
+        fps: float = 25.0,
+    ) -> Dict[str, Any]:
+        """Procesa un fotograma BGR y devuelve la imagen compuesta (cámara etiquetada + plano 2D)."""
+        step = self.infer_single_frame_pass1(
+            frame_bgr, frame_idx=frame_idx, fps=fps, is_video=is_video
+        )
+        players = step["players"]
+        balls = step["balls"]
+        homog_res = step["homography"]
+
         stab_mode = self.stabilizer.stabilization_method
         annotated_cam = self.renderer.draw_camera_annotations(
             frame_bgr, players, balls, homog_res, stabilization_mode=stab_mode
@@ -131,14 +190,12 @@ class Soccer2DTrackingPipeline:
         out_path = self._resolve_output_path(in_path, output_path, is_video=False)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self.stabilizer.reset_temporal_state()
-        self.renderer.reset_trails()
-
+        self._reset_all_states()
         res = self.process_frame_array(frame_bgr, is_video=False)
         cv2.imwrite(str(out_path), res["combined_frame"])
 
         homog: Any = res["homography"]
-        print("=" * 70)
+        print("=" * 72)
         print("✅ IMAGEN PROCESADA EXITOSAMENTE")
         print(f"   Entrada:            {in_path}")
         print(f"   Salida Etiquetada:  {out_path}")
@@ -146,7 +203,7 @@ class Soccer2DTrackingPipeline:
         print(f"   Balón (c>=0.4):     {len(res['balls'])} detectado(s)")
         print(f"   Keypoints:          {homog.num_detected} detectados | {homog.num_inliers} inliers MAGSAC++")
         print(f"   Estado Homografía:  {homog.status_message}")
-        print("=" * 70)
+        print("=" * 72)
         return out_path
 
     def process_video(
@@ -155,7 +212,11 @@ class Soccer2DTrackingPipeline:
         output_path: Optional[Union[str, Path]] = None,
         max_frames: Optional[int] = None,
     ) -> Path:
-        """Procesa un archivo de video cuadro a cuadro (restringido por defecto a 3000 frames) y devuelve el video etiquetado con el plano 2D."""
+        """
+        Procesa un archivo de video (restringido por defecto a 3000 frames) ejecutando:
+          - Pasada 1: Inferencia frame a frame + Homografía MAGSAC++ + Kalman 2D + Equipo + OCR.
+          - Pasada 2: Global Tracklet Stitching sobre datos tabulares + Renderizado final del video.
+        """
         in_path = Path(video_path)
         if not in_path.exists():
             raise FileNotFoundError(f"Video no encontrado: {in_path}")
@@ -169,24 +230,35 @@ class Soccer2DTrackingPipeline:
 
         fps = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        target_frames = min(total_frames, max_frames) if (max_frames and total_frames > 0) else (max_frames or total_frames)
+        target_frames = (
+            min(total_frames, max_frames)
+            if (max_frames and total_frames > 0)
+            else (max_frames or total_frames)
+        )
 
         out_path = self._resolve_output_path(in_path, output_path, is_video=True)
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        self._reset_all_states()
 
-        self.stabilizer.reset_temporal_state()
-        self.renderer.reset_trails()
-
-        writer = None
-        frame_idx = 0
-        t0 = time.time()
-
-        print("=" * 70)
-        print("🚀 INICIANDO PROCESAMIENTO DE VIDEO (JUGADOR + BALÓN + HOMOGRAFÍA 2D)")
+        print("=" * 72)
+        print("🚀 INICIANDO PIPELINE DE VIDEO (2 PASADAS: KALMAN 2D + GLOBAL STITCHING)")
         print(f"   Video Entrada:      {in_path.name} ({target_frames} cuadros @ {fps:.1f} FPS)")
         print(f"   Método Estabiliz.:  {self.stabilizer.stabilization_method.upper()}")
         print(f"   Confianza Jugador:  {self.detector.conf_player:.2f} | Balón: {self.detector.conf_ball:.2f}")
-        print("=" * 70)
+        print(f"   Modo 2 Pasadas:     {'ACTIVADO (Pasada 1 + Pasada 2 Tabular)' if self.enable_two_pass else 'DESACTIVADO (1 Pasada)'}")
+        print("=" * 72)
+
+        # Si el usuario desactiva explícitamente las 2 pasadas, procesar en 1 sola pasada directa
+        if not self.enable_two_pass:
+            return self._process_video_single_pass(cap, out_path, target_frames, fps, max_frames)
+
+        # =====================================================================
+        # PASADA 1: Inferencia Frame a Frame + Kalman 2D + Equipo + Dorsal OCR
+        # =====================================================================
+        print("▶ [PASADA 1/2] Inferencia Frame a Frame + Homografía 2D + Kalman 2D + OCR...")
+        frame_cache_meta: Dict[int, Dict[str, Any]] = {}
+        frame_idx = 0
+        t_pass1 = time.time()
 
         try:
             while cap.isOpened():
@@ -197,8 +269,81 @@ class Soccer2DTrackingPipeline:
                     break
 
                 frame_idx += 1
-                res = self.process_frame_array(frame_bgr, is_video=True)
-                combined = res["combined_frame"]
+                step = self.infer_single_frame_pass1(
+                    frame_bgr, frame_idx=frame_idx, fps=fps, is_video=True
+                )
+                frame_cache_meta[frame_idx] = {
+                    "balls": step["balls"],
+                    "homography": step["homography"],
+                }
+
+                if frame_idx % 10 == 0 or frame_idx == target_frames:
+                    elapsed = max(1e-6, time.time() - t_pass1)
+                    curr_fps = frame_idx / elapsed
+                    pct = (frame_idx / max(1, target_frames)) * 100.0
+                    print(
+                        f"\r   [Pasada 1] {frame_idx}/{target_frames} ({pct:5.1f}%) | "
+                        f"{curr_fps:4.1f} FPS | {step['homography'].status_message[:40]}",
+                        end="",
+                        flush=True,
+                    )
+        finally:
+            cap.release()
+            print()
+
+        # =====================================================================
+        # PASADA 2: Post-procesamiento Tabular y Global Tracklet Stitching
+        # =====================================================================
+        print("▶ [PASADA 2/2] Ejecutando Global Tracklet Stitching y propagación de dorsales...")
+        t_stitch = time.time()
+        stitcher = GlobalTrackletStitcher(config=self.config, fps=fps)
+        raw_records = self.tracker_2d.tabular_records
+        stitched_records, stitch_stats = stitcher.stitch_and_propagate(raw_records)
+        stitched_by_frame = stitcher.build_frame_lookup(stitched_records)
+
+        raw_csv_path = out_path.with_name(f"{out_path.stem}_raw_tracks.csv")
+        stitched_csv_path = out_path.with_name(f"{out_path.stem}_stitched_tracks.csv")
+        stitcher.export_to_csv(raw_records, raw_csv_path)
+        stitcher.export_to_csv(stitched_records, stitched_csv_path)
+        stitch_elapsed = time.time() - t_stitch
+
+        print(
+            f"   ✓ Cosido completado en {stitch_elapsed:.2f}s: "
+            f"{stitch_stats['raw_tracklets']} fragmentos -> {stitch_stats['stitched_players']} identidades globales "
+            f"({stitch_stats['merges_performed']} uniones, {stitch_stats['jerseys_assigned']} dorsales propagados)."
+        )
+
+        # Renderizado del video final con los IDs globales cosidos y dorsales propagados desde el Frame 1
+        print("▶ Renderizando video final con trayectorias 2D cosidas...")
+        cap2 = cv2.VideoCapture(str(in_path))
+        writer = None
+        render_idx = 0
+        self.renderer.reset_trails()
+        stab_mode = self.stabilizer.stabilization_method
+        t_rend = time.time()
+
+        try:
+            while cap2.isOpened() and render_idx < frame_idx:
+                ret, frame_bgr = cap2.read()
+                if not ret or frame_bgr is None:
+                    break
+
+                render_idx += 1
+                meta = frame_cache_meta.get(render_idx)
+                if meta is None:
+                    continue
+
+                players_stitched = stitched_by_frame.get(render_idx, [])
+                balls = meta["balls"]
+                homog_res = meta["homography"]
+
+                annotated_cam = self.renderer.draw_camera_annotations(
+                    frame_bgr, players_stitched, balls, homog_res, stabilization_mode=stab_mode
+                )
+                plane_2d = self.renderer.render_2d_plane(
+                    players_stitched, balls, homog_res, update_trails=True
+                )
+                combined = self.renderer.compose_side_by_side(annotated_cam, plane_2d)
 
                 if writer is None:
                     h_out, w_out = combined.shape[:2]
@@ -207,13 +352,57 @@ class Soccer2DTrackingPipeline:
 
                 writer.write(combined)
 
+                if render_idx % 20 == 0 or render_idx == frame_idx:
+                    pct = (render_idx / max(1, frame_idx)) * 100.0
+                    print(f"\r   [Render 2D] {render_idx}/{frame_idx} ({pct:5.1f}%)", end="", flush=True)
+        finally:
+            cap2.release()
+            if writer is not None:
+                writer.release()
+            print()
+
+        total_t = time.time() - t_pass1
+        print("=" * 72)
+        print("✅ VIDEO Y COSIDO GLOBAL COMPLETADOS EXITOSAMENTE")
+        print(f"   Video Etiquetado:   {out_path}")
+        print(f"   CSV Pasada 1 Crudo: {raw_csv_path}")
+        print(f"   CSV Pasada 2 Cosido:{stitched_csv_path}")
+        print(f"   Cuadros Procesados: {frame_idx} en {total_t:.1f}s")
+        print("=" * 72)
+        return out_path
+
+    def _process_video_single_pass(
+        self,
+        cap: cv2.VideoCapture,
+        out_path: Path,
+        target_frames: int,
+        fps: float,
+        max_frames: Optional[int],
+    ) -> Path:
+        writer = None
+        frame_idx = 0
+        t0 = time.time()
+        try:
+            while cap.isOpened():
+                ret, frame_bgr = cap.read()
+                if not ret or frame_bgr is None:
+                    break
+                if max_frames and frame_idx >= max_frames:
+                    break
+                frame_idx += 1
+                res = self.process_frame_array(frame_bgr, is_video=True, frame_idx=frame_idx, fps=fps)
+                combined = res["combined_frame"]
+                if writer is None:
+                    h_out, w_out = combined.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w_out, h_out))
+                writer.write(combined)
                 if frame_idx % 10 == 0 or frame_idx == target_frames:
                     elapsed = max(1e-6, time.time() - t0)
                     curr_fps = frame_idx / elapsed
                     pct = (frame_idx / max(1, target_frames)) * 100.0
                     print(
-                        f"\r   Progreso: {frame_idx}/{target_frames} ({pct:5.1f}%) | "
-                        f"{curr_fps:4.1f} FPS | {res['homography'].status_message[:42]}",
+                        f"\r   Progreso: {frame_idx}/{target_frames} ({pct:5.1f}%) | {curr_fps:4.1f} FPS",
                         end="",
                         flush=True,
                     )
@@ -222,13 +411,6 @@ class Soccer2DTrackingPipeline:
             if writer is not None:
                 writer.release()
             print()
-
-        total_t = time.time() - t0
-        print("=" * 70)
-        print("✅ VIDEO PROCESADO EXITOSAMENTE")
-        print(f"   Video Etiquetado:   {out_path}")
-        print(f"   Cuadros Procesados: {frame_idx} en {total_t:.1f}s")
-        print("=" * 70)
         return out_path
 
     def process(
@@ -265,7 +447,7 @@ class Soccer2DTrackingPipeline:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Inferencia de Jugador (conf=0.5), Balón (conf=0.4) y Homografía 2D con MAGSAC++"
+        description="Inferencia de Jugador (conf=0.5), Balón (conf=0.4), Homografía 2D (MAGSAC++) y Cosido Global en 2 Pasadas"
     )
     parser.add_argument(
         "input_pos",
@@ -313,6 +495,12 @@ def parse_args() -> argparse.Namespace:
         default=3000,
         help="Límite máximo de fotogramas a procesar en video (por defecto: 3000 frames)",
     )
+    parser.add_argument(
+        "--single-pass",
+        action="store_true",
+        default=False,
+        help="Ejecutar en 1 sola pasada sin el post-procesamiento tabular de la Pasada 2",
+    )
     return parser.parse_args()
 
 
@@ -330,6 +518,7 @@ def main() -> None:
         stabilization_override=args.stabilization,
         conf_player_override=args.conf_player,
         conf_ball_override=args.conf_ball,
+        two_pass_override=(False if args.single_pass else None),
     )
     pipeline.process(
         input_path=input_source,
@@ -340,4 +529,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

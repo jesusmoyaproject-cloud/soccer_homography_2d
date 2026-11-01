@@ -32,3 +32,4 @@ jobs:
     - name: Ejecutar Pruebas Unitarias y Validacion Topologica (pytest)
       run: |
         python -m pytest tests/test_pipeline.py -v
+
