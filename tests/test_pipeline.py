@@ -386,13 +386,33 @@ def test_ball_spatial_likelihood_dynamic_roi_fsm_and_reconstruction():
         "shot_cut": False,
         "is_interpolated": False,
     })
+    bt.tabular_records.append({
+        "frame": 8,
+        "detected": True,
+        "state": "LOCKED",
+        "conf": 0.78,
+        "likelihood": 0.82,
+        "center_px_x": 590.0,
+        "center_px_y": 414.0,
+        "bbox_w": 16.0,
+        "bbox_h": 16.0,
+        "pitch_x_m": 39.5,
+        "pitch_y_m": 25.7,
+        "speed_mps": 12.0,
+        "carrier_id": None,
+        "roi_used": True,
+        "homography_valid": True,
+        "shot_cut": False,
+        "is_interpolated": False,
+    })
 
     reconstructor = BallTrajectoryReconstructor(fps=fps)
     recon_rows, stats = reconstructor.reconstruct(bt.tabular_records)
     assert stats["spikes_removed"] == 1
-    assert stats["active_ball_frames"] == 7
+    assert stats["active_ball_frames"] == 8
     lookup = reconstructor.build_frame_lookup(recon_rows)
     # El frame 6 (antes pico en 1500.0) ahora debe estar interpolado suavemente cerca de ~560 px
     assert 540.0 <= lookup[6][0]["center_px"][0] <= 580.0
+
 
 

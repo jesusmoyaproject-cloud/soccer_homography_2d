@@ -550,25 +550,41 @@ class BallTrajectoryReconstructor:
         Detecta detecciones aisladas (picos de 1 fotograma) cuya velocidad de entrada y salida
         viola la física del balón mientras que los fotogramas adyacentes son consistentes entre sí.
         """
-        detected_indices = [i for i, r in enumerate(rows) if r.get("detected", False)]
+        detected_indices = [
+            i
+            for i, r in enumerate(rows)
+            if r.get("detected", False)
+            and r.get("center_px_x") is not None
+            and r.get("center_px_y") is not None
+        ]
         if len(detected_indices) < 3:
             return 0
 
         spikes_removed = 0
+        last_valid_idx = detected_indices[0]
+
         for k in range(1, len(detected_indices) - 1):
-            i_prev = detected_indices[k - 1]
+            i_prev = last_valid_idx
             i_curr = detected_indices[k]
             i_next = detected_indices[k + 1]
 
             r_prev, r_curr, r_next = rows[i_prev], rows[i_curr], rows[i_next]
+            if (
+                r_prev.get("center_px_x") is None
+                or r_curr.get("center_px_x") is None
+                or r_next.get("center_px_x") is None
+            ):
+                continue
+
             if r_curr.get("shot_cut") or r_next.get("shot_cut"):
+                last_valid_idx = i_curr
                 continue
 
             dt1 = max(1, int(r_curr["frame"]) - int(r_prev["frame"]))
             dt2 = max(1, int(r_next["frame"]) - int(r_curr["frame"]))
-            dt_bridge = dt1 + dt2
 
             if dt1 > 6 or dt2 > 6:
+                last_valid_idx = i_curr
                 continue
 
             d1_px = float(
@@ -600,8 +616,11 @@ class BallTrajectoryReconstructor:
             if (
                 not is_spike
                 and r_prev.get("pitch_x_m") is not None
+                and r_prev.get("pitch_y_m") is not None
                 and r_curr.get("pitch_x_m") is not None
+                and r_curr.get("pitch_y_m") is not None
                 and r_next.get("pitch_x_m") is not None
+                and r_next.get("pitch_y_m") is not None
             ):
                 d1_m = float(
                     np.hypot(
@@ -635,6 +654,8 @@ class BallTrajectoryReconstructor:
                 r_curr["pitch_y_m"] = None
                 r_curr["is_interpolated"] = True
                 spikes_removed += 1
+            else:
+                last_valid_idx = i_curr
 
         return spikes_removed
 
@@ -659,7 +680,13 @@ class BallTrajectoryReconstructor:
         spikes_removed = self._remove_kinematic_spikes(rows)
 
         # Paso 2: Interpolar huecos acotados (<= max_interp_gap_frames) sin corte de cámara
-        detected_idxs = [i for i, r in enumerate(rows) if r.get("detected", False)]
+        detected_idxs = [
+            i
+            for i, r in enumerate(rows)
+            if r.get("detected", False)
+            and r.get("center_px_x") is not None
+            and r.get("center_px_y") is not None
+        ]
         interpolated_count = 0
 
         for k in range(len(detected_idxs) - 1):
@@ -679,7 +706,12 @@ class BallTrajectoryReconstructor:
             dt_sec = (int(r_b["frame"]) - int(r_a["frame"])) / self.fps
 
             # Validar que la distancia entre A y B sea físicamente alcanzable por un balón
-            has_pitch = (r_a.get("pitch_x_m") is not None) and (r_b.get("pitch_x_m") is not None)
+            has_pitch = (
+                r_a.get("pitch_x_m") is not None
+                and r_a.get("pitch_y_m") is not None
+                and r_b.get("pitch_x_m") is not None
+                and r_b.get("pitch_y_m") is not None
+            )
             if has_pitch:
                 dist_m = float(
                     np.hypot(
@@ -844,3 +876,4 @@ class BallTrajectoryReconstructor:
             writer.writeheader()
             writer.writerows(rows)
         return out_path
+
