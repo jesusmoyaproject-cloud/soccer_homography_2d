@@ -160,17 +160,23 @@ def select_apollonius_ball_carrier(
             pvx = float(p.get("vx_mps", 0.0))
             pvy = float(p.get("vy_mps", 0.0))
 
+            # Punto de intercepción inercial del balón tras t_reac (0.15s)
+            ball_inert_m = (
+                float(ball_pos_m[0]) + bvx * 0.15,
+                float(ball_pos_m[1]) + bvy * 0.15,
+            )
+
             # Tiempo de intercepción de Apolonio convertido a distancia equivalente en metros
             t_apol = apollonius_time_to_intercept(
-                pm, (pvx, pvy), ball_pos_m, max_speed_mps=9.5, reaction_time_s=0.14
+                pm, (pvx, pvy), ball_inert_m, max_speed_mps=9.5, reaction_time_s=0.14
             )
-            eff_m = 0.55 * d_m + 0.45 * (t_apol * 5.0)
+            eff_m = 0.45 * d_m + 0.55 * (t_apol * 5.0)
 
             # Si el balón y el jugador se mueven en la misma dirección, reducir costo (conducción activa)
             p_speed = float(np.hypot(pvx, pvy))
-            if b_speed > 1.2 and p_speed > 1.0:
+            if b_speed > 1.2 and p_speed > 0.8:
                 cos_v = (bvx * pvx + bvy * pvy) / (b_speed * p_speed)
-                eff_m *= (1.0 - 0.18 * cos_v)
+                eff_m *= (1.0 - 0.28 * cos_v)
         else:
             d_m = 999.0
             eff_m = d_px / 35.0
