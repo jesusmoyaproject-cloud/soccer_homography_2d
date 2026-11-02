@@ -104,3 +104,4 @@ class ThreadedVideoReader:
                 break
             yield idx, frame
         self.release()
+

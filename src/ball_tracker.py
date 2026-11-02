@@ -23,6 +23,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
 import numpy as np
+from src.spatial_geometry import (
+    apollonius_directional_ball_bonus,
+    select_apollonius_ball_carrier,
+    find_apollonius_intermediate_touch,
+)
 
 
 class BallState(str, Enum):
@@ -184,30 +189,23 @@ class BallPhysicsTracker:
         players: List[Dict[str, Any]],
     ) -> Tuple[Optional[Dict[str, Any]], float, float]:
         """
-        Busca el jugador cuyos pies están más cerca de la posición estimada del balón.
+        Selecciona al jugador poseedor/oclusor usando la Geometría de Apolonio y Voronoi:
+        evalúa quién intercepta primero la trayectoria del balón según su vector velocidad.
         Retorna: (player_dict, dist_m, dist_px)
         """
-        best_player = None
-        best_dist_m = 1e6
-        best_dist_px = 1e6
-
-        for p in players:
-            if p.get("role") == "Referee":
-                continue
-            fx, fy = p["foot_px"]
-            d_px = float(np.hypot(fx - target_px[0], fy - target_px[1]))
-            pm = p.get("pitch_m")
-            if target_m is not None and pm is not None:
-                d_m = float(np.hypot(pm[0] - target_m[0], pm[1] - target_m[1]))
-            else:
-                d_m = d_px / 18.0
-
-            if d_m < best_dist_m:
-                best_dist_m = d_m
-                best_dist_px = d_px
-                best_player = p
-
-        return best_player, best_dist_m, best_dist_px
+        ball_vel_mps = (
+            (float(self.kf_pitch.x[2]), float(self.kf_pitch.x[3]))
+            if self.kf_pitch is not None
+            else (0.0, 0.0)
+        )
+        return select_apollonius_ball_carrier(
+            ball_pos_px=target_px,
+            ball_pos_m=target_m,
+            ball_vel_mps=ball_vel_mps,
+            players=players,
+            max_radius_m=self.player_occlusion_radius_m,
+            max_radius_px=self.player_occlusion_radius_px,
+        )
 
     def select_best_candidate(
         self,
@@ -219,9 +217,9 @@ class BallPhysicsTracker:
         homography_valid: bool,
     ) -> Optional[Dict[str, Any]]:
         """
-        Selector por Verosimilitud Espacial sobre candidatos con conf >= 0.15:
+        Selector por Verosimilitud Espacial + Lóbulo Direccional de Apolonio sobre candidatos con conf >= 0.15:
         Evalúa verosimilitud combinando confianza del detector + cercanía gaussiana
-        a la predicción cinemática + validación biomecánica/física en metros.
+        a la predicción cinemática + modificador direccional de Apolonio + validación en metros.
         """
         if not candidates:
             return None
@@ -260,10 +258,15 @@ class BallPhysicsTracker:
             self._tentative_cand = (self.last_frame_idx + 1, cx, cy, best.get("pitch_m"))
             return None
 
-        # Estado activo (LOCKED, COASTING, OCCLUDED_BY_PLAYER): Evaluar Verosimilitud Espacial
+        # Estado activo (LOCKED, COASTING, OCCLUDED_BY_PLAYER): Evaluar Verosimilitud Espacial + Apolonio
         sigma_px = self.base_gate_px + self.gate_expansion_px * float(min(dt_frames, 15))
         max_jump_px = self.max_ball_jump_px_per_frame * float(max(1, min(dt_frames, 10)))
         max_jump_m = self.max_ball_speed_mps * dt_sec + 3.0
+        vel_px = (
+            (float(self.kf_px.x[2]), float(self.kf_px.x[3]))
+            if self.kf_px is not None
+            else (0.0, 0.0)
+        )
 
         best_cand = None
         best_score = -1.0
@@ -288,7 +291,8 @@ class BallPhysicsTracker:
                     continue
 
             spatial_prob = float(np.exp(-(dist_px**2) / (2.0 * (sigma_px**2))))
-            likelihood = self.w_conf * conf + self.w_spatial * spatial_prob
+            apollonius_mod = apollonius_directional_ball_bonus(pred_px, vel_px, (cx, cy))
+            likelihood = self.w_conf * conf + self.w_spatial * spatial_prob + apollonius_mod
 
             if likelihood >= self.min_likelihood_score and likelihood > best_score:
                 best_score = likelihood
@@ -722,29 +726,53 @@ class BallTrajectoryReconstructor:
                 if dist_m > (self.max_ball_speed_mps * dt_sec + 5.0):
                     continue
 
+            # Evaluar si existe un toque/rebote intermedio según el Círculo de Apolonio (A -> M -> B)
+            pivot = find_apollonius_intermediate_touch(
+                r_a, r_b, self.fps, stitched_players_by_frame, self.max_ball_speed_mps
+            )
+
             for m in range(idx_a + 1, idx_b):
                 alpha = float(m - idx_a) / float(idx_b - idx_a)
                 row_m = rows[m]
                 f_num = int(row_m["frame"])
 
-                # Coordenadas interpoladas base (vuelo libre entre A y B)
-                ix_px = (1.0 - alpha) * float(r_a["center_px_x"]) + alpha * float(r_b["center_px_x"])
-                iy_px = (1.0 - alpha) * float(r_a["center_px_y"]) + alpha * float(r_b["center_px_y"])
-                ix_m = (
-                    (1.0 - alpha) * float(r_a["pitch_x_m"]) + alpha * float(r_b["pitch_x_m"])
-                    if has_pitch
-                    else None
-                )
-                iy_m = (
-                    (1.0 - alpha) * float(r_a["pitch_y_m"]) + alpha * float(r_b["pitch_y_m"])
-                    if has_pitch
-                    else None
-                )
+                if pivot is not None:
+                    f_piv = int(pivot["frame"])
+                    px_piv, py_piv = pivot["center_px"]
+                    mx_piv, my_piv = pivot["pitch_m"]
+                    if f_num <= f_piv:
+                        seg_alpha = float(f_num - int(r_a["frame"])) / float(max(1, f_piv - int(r_a["frame"])))
+                        ix_px = (1.0 - seg_alpha) * float(r_a["center_px_x"]) + seg_alpha * px_piv
+                        iy_px = (1.0 - seg_alpha) * float(r_a["center_px_y"]) + seg_alpha * py_piv
+                        ix_m = (1.0 - seg_alpha) * float(r_a["pitch_x_m"]) + seg_alpha * mx_piv if has_pitch else None
+                        iy_m = (1.0 - seg_alpha) * float(r_a["pitch_y_m"]) + seg_alpha * my_piv if has_pitch else None
+                    else:
+                        seg_alpha = float(f_num - f_piv) / float(max(1, int(r_b["frame"]) - f_piv))
+                        ix_px = (1.0 - seg_alpha) * px_piv + seg_alpha * float(r_b["center_px_x"])
+                        iy_px = (1.0 - seg_alpha) * py_piv + seg_alpha * float(r_b["center_px_y"])
+                        ix_m = (1.0 - seg_alpha) * mx_piv + seg_alpha * float(r_b["pitch_x_m"]) if has_pitch else None
+                        iy_m = (1.0 - seg_alpha) * my_piv + seg_alpha * float(r_b["pitch_y_m"]) if has_pitch else None
+                    if abs(f_num - f_piv) <= 1 and row_m.get("carrier_id") is None:
+                        row_m["carrier_id"] = int(pivot["carrier_id"])
+                else:
+                    # Coordenadas interpoladas base (vuelo libre entre A y B)
+                    ix_px = (1.0 - alpha) * float(r_a["center_px_x"]) + alpha * float(r_b["center_px_x"])
+                    iy_px = (1.0 - alpha) * float(r_a["center_px_y"]) + alpha * float(r_b["center_px_y"])
+                    ix_m = (
+                        (1.0 - alpha) * float(r_a["pitch_x_m"]) + alpha * float(r_b["pitch_x_m"])
+                        if has_pitch
+                        else None
+                    )
+                    iy_m = (
+                        (1.0 - alpha) * float(r_a["pitch_y_m"]) + alpha * float(r_b["pitch_y_m"])
+                        if has_pitch
+                        else None
+                    )
 
                 # Si durante el hueco el balón estaba ocluido por un jugador poseedor conocido,
                 # combinar suavemente con la posición de los pies de ese jugador
                 carrier_id = row_m.get("carrier_id")
-                if carrier_id is not None and stitched_players_by_frame is not None:
+                if carrier_id is not None and stitched_players_by_frame is not None and pivot is None:
                     frame_players = stitched_players_by_frame.get(f_num, [])
                     carrier = next(
                         (
@@ -771,7 +799,10 @@ class BallTrajectoryReconstructor:
                 row_m["pitch_x_m"] = round(float(ix_m), 3) if ix_m is not None else None
                 row_m["pitch_y_m"] = round(float(iy_m), 3) if iy_m is not None else None
                 row_m["conf"] = round((1.0 - alpha) * float(r_a["conf"]) + alpha * float(r_b["conf"]), 3)
-                row_m["state"] = "RECONSTRUCTED_OCCLUSION" if carrier_id is not None else "RECONSTRUCTED_FLIGHT"
+                if pivot is not None:
+                    row_m["state"] = "RECONSTRUCTED_APOLLONIUS_TOUCH"
+                else:
+                    row_m["state"] = "RECONSTRUCTED_OCCLUSION" if carrier_id is not None else "RECONSTRUCTED_FLIGHT"
                 row_m["is_interpolated"] = True
                 interpolated_count += 1
 

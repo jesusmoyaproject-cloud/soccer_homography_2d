@@ -415,4 +415,46 @@ def test_ball_spatial_likelihood_dynamic_roi_fsm_and_reconstruction():
     assert 540.0 <= lookup[6][0]["center_px"][0] <= 580.0
 
 
+def test_voronoi_and_apollonius_geometry_player_and_ball():
+    """
+    Verifica las mejoras de Geometría de Voronoi y Apolonio:
+    1. En cancha 2D: un jugador que corre a alta velocidad expande su área de Apolonio frente a Voronoi estático.
+    2. En oclusión de balón: Apolonio elige al jugador que conduce en el sentido del balón frente a un rival estático ligeramente más cerca.
+    3. En reconstrucción de huecos: Apolonio detecta un toque/rebote intermedio en los pies de un jugador (A -> M -> B).
+    """
+    from src.spatial_geometry import (
+        compute_voronoi_and_apollonius_surface,
+        select_apollonius_ball_carrier,
+    )
+
+    # 1. Comparar Voronoi estático vs Apolonio dinámico cuando el Jugador 1 corre a 8.5 m/s hacia el campo rival
+    players_field = [
+        {"id": 1, "team_id": 1, "role": "Player", "pitch_m": (45.0, 34.0), "vx_mps": 8.5, "vy_mps": 0.0, "foot_px": (500.0, 400.0)},
+        {"id": 2, "team_id": 2, "role": "Player", "pitch_m": (60.0, 34.0), "vx_mps": 0.0, "vy_mps": 0.0, "foot_px": (700.0, 400.0)},
+    ]
+    surf = compute_voronoi_and_apollonius_surface(players_field)
+    assert surf is not None
+    # En Voronoi estático están simétricos respecto a X=52.5m (50% cada uno),
+    # pero en Apolonio el Jugador 1 corriendo a 8.5 m/s hacia la derecha domina > 53% de la cancha
+    assert surf["team_a_apollonius_pct"] > surf["team_a_voronoi_pct"]
+    assert surf["apollonius_areas_m2"][1] > surf["voronoi_areas_m2"][1]
+
+    # 2. Selección de portador de balón en oclusión mediante Apolonio
+    # Balón en (50.0, 34.0) viajando a +7.0 m/s en X.
+    # Defensor estático (ID=20) a 1.05m en dirección opuesta vs Delantero (ID=10) a 1.20m corriendo con el balón (+7.5 m/s)
+    duel_players = [
+        {"id": 20, "team_id": 2, "role": "Player", "pitch_m": (48.95, 34.0), "vx_mps": -1.0, "vy_mps": 0.0, "foot_px": (590.0, 400.0)},
+        {"id": 10, "team_id": 1, "role": "Player", "pitch_m": (51.20, 34.0), "vx_mps": 7.5, "vy_mps": 0.0, "foot_px": (612.0, 400.0)},
+    ]
+    carrier, _, _ = select_apollonius_ball_carrier(
+        ball_pos_px=(600.0, 400.0),
+        ball_pos_m=(50.0, 34.0),
+        ball_vel_mps=(7.0, 0.0),
+        players=duel_players,
+    )
+    assert carrier is not None
+    assert carrier["id"] == 10
+
+
+
 

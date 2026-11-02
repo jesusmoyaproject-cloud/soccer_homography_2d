@@ -7,6 +7,7 @@ Gating por Equipo (CIE-LAB) y reconexión inmediata de pistas en coordenadas de 
 from typing import Dict, List, Tuple, Optional, Any
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+from src.spatial_geometry import apollonius_reach_cost
 
 
 class KalmanTrack2D:
@@ -204,6 +205,8 @@ class PitchBoTSORT2D:
                     p["id"] = can_id
                     p["pitch_m"] = (kx, ky)
                     p["speed_mps"] = round(spd, 2)
+                    p["vx_mps"] = round(float(trk.x[2]), 3)
+                    p["vy_mps"] = round(float(trk.x[3]), 3)
                     if trk.jersey_number and not p.get("jersey_number"):
                         p["jersey_number"] = trk.jersey_number
                     active_canonical_ids_in_frame.add(can_id)
@@ -251,12 +254,21 @@ class PitchBoTSORT2D:
                     if dist_m > max_gate_m:
                         continue
 
+                    # Costo anisotrópico de alcance de Apolonio
+                    apol_dist = apollonius_reach_cost(
+                        (float(trk.x[0]), float(trk.x[1])),
+                        (float(trk.x[2]), float(trk.x[3])),
+                        pm,
+                        dt_sec=dt,
+                        max_speed_mps=self.max_speed_mps,
+                    )
+
                     color_cost = 0.0
                     if p_lab is not None and trk.lab_feature is not None:
                         color_cost = float(np.linalg.norm(p_lab - trk.lab_feature)) / 50.0
 
                     jersey_bonus = -1.5 if (p_jersey and trk.jersey_number and p_jersey == trk.jersey_number) else 0.0
-                    cost_mat[i, j] = dist_m + 0.5 * color_cost + jersey_bonus
+                    cost_mat[i, j] = apol_dist + 0.5 * color_cost + jersey_bonus
 
             row_ind, col_ind = linear_sum_assignment(cost_mat)
             matched_det_indices = set()
@@ -282,6 +294,8 @@ class PitchBoTSORT2D:
                     p["id"] = can_id
                     p["pitch_m"] = (kx, ky)
                     p["speed_mps"] = round(spd, 2)
+                    p["vx_mps"] = round(float(trk.x[2]), 3)
+                    p["vy_mps"] = round(float(trk.x[3]), 3)
                     if trk.jersey_number and not p.get("jersey_number"):
                         p["jersey_number"] = trk.jersey_number
                     active_canonical_ids_in_frame.add(can_id)
@@ -301,6 +315,8 @@ class PitchBoTSORT2D:
             p["raw_track_id"] = raw_id
             p["id"] = can_id
             p["speed_mps"] = 0.0
+            p["vx_mps"] = 0.0
+            p["vy_mps"] = 0.0
 
             pm = p.get("pitch_m")
             if homography_valid and pm is not None:
@@ -344,6 +360,8 @@ class PitchBoTSORT2D:
                     "pitch_x_m": round(float(pm[0]), 3) if pm is not None else None,
                     "pitch_y_m": round(float(pm[1]), 3) if pm is not None else None,
                     "speed_mps": round(float(p.get("speed_mps", 0.0)), 2),
+                    "vx_mps": round(float(p.get("vx_mps", 0.0)), 3),
+                    "vy_mps": round(float(p.get("vy_mps", 0.0)), 3),
                     "team_id": int(p.get("team_id", 1)),
                     "team_label": str(p.get("team_label", "Team_A")),
                     "color_b": int(bgr[0]),

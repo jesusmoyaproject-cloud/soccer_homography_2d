@@ -140,4 +140,6 @@ visualization:
   trail_length: 35               # Cantidad de fotogramas de estela de movimiento en el plano 2D
   draw_projected_lines: true     # Proyectar líneas de cancha 2D sobre el video/imagen original
   draw_keypoints: true           # Dibujar los keypoints detectados con su ID y conf
+  enable_voronoi_apollonius: true # Dibuja celdas y control espacial de Voronoi y Apolonio en el minimapa 2D
+  spatial_overlay_alpha: 0.22    # Transparencia del mapa de dominio territorial en el minimapa 2D
   output_dir: "outputs"

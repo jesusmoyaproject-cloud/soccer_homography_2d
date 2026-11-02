@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+from src.spatial_geometry import apollonius_reach_cost
 
 
 @dataclass
@@ -234,19 +235,20 @@ class GlobalTrackletStitcher:
         if not same_confirmed_jersey and dt_sec > self.max_stitch_gap_sec:
             return INF
 
-        # 4. Distancia en el plano 2D de la cancha
+        # 4. Distancia en el plano 2D de la cancha con Región Cinemática de Apolonio
         dist_cost = 0.0
         if frag_a.end_pos_m is not None and frag_b.start_pos_m is not None:
-            # Extrapolación cinemática amortiguada para huecos cortos (<= 1.2s)
-            dt_extrap = min(dt_sec, 1.2)
-            pred_x = frag_a.end_pos_m[0] + frag_a.end_vel_mps[0] * dt_extrap
-            pred_y = frag_a.end_pos_m[1] + frag_a.end_vel_mps[1] * dt_extrap
-
-            dist_m = float(np.hypot(frag_b.start_pos_m[0] - pred_x, frag_b.start_pos_m[1] - pred_y))
+            apol_dist_m = apollonius_reach_cost(
+                frag_a.end_pos_m,
+                frag_a.end_vel_mps,
+                frag_b.start_pos_m,
+                dt_sec=dt_sec,
+                max_speed_mps=self.max_speed_mps,
+            )
             raw_dist_m = float(
                 np.hypot(frag_b.start_pos_m[0] - frag_a.end_pos_m[0], frag_b.start_pos_m[1] - frag_a.end_pos_m[1])
             )
-            eff_dist_m = min(dist_m, raw_dist_m)
+            eff_dist_m = min(apol_dist_m, raw_dist_m)
 
             max_reachable_m = self.max_speed_mps * dt_sec + 3.5
             if not same_confirmed_jersey:
@@ -469,6 +471,8 @@ class GlobalTrackletStitcher:
                     "foot_px": (float(rec["foot_px_x"]), float(rec["foot_px_y"])),
                     "pitch_m": pm,
                     "speed_mps": float(rec.get("speed_mps", 0.0)),
+                    "vx_mps": float(rec.get("vx_mps", 0.0)),
+                    "vy_mps": float(rec.get("vy_mps", 0.0)),
                     "team_id": int(rec.get("team_id", 1)),
                     "team_label": str(rec.get("team_label", "Team_A")),
                     "color_bgr": (
