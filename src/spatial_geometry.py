@@ -45,15 +45,18 @@ def apollonius_time_to_intercept(
         return 0.0
 
     speed_curr = float(np.hypot(vx, vy))
-    # Bonificación/penalización de velocidad efectiva según alineación direccional (coseno)
+    turn_penalty_s = 0.0
+    eff_speed = max(4.0, max_speed_mps)
     if speed_curr > 0.4:
         cos_align = (vx * dx + vy * dy) / (speed_curr * dist_rem)
-        # Si ya corre hacia el objetivo, su velocidad efectiva es mayor; a contrapié es menor
-        eff_speed = max(3.5, max_speed_mps + 0.25 * speed_curr * cos_align)
-    else:
-        eff_speed = max(3.5, max_speed_mps * 0.90)
+        if cos_align >= 0.0:
+            # En el cono frontal, el jugador aprovecha su momento lineal (Círculo de Apolonio)
+            eff_speed = max_speed_mps + 0.22 * speed_curr * cos_align
+        else:
+            # A contrapié, sufre una penalización fija de frenado/giro en segundos (no reduce su v_max a larga distancia)
+            turn_penalty_s = 0.32 * (-cos_align) * (speed_curr / max(1.0, max_speed_mps))
 
-    return float(reaction_time_s + dist_rem / eff_speed)
+    return float(reaction_time_s + turn_penalty_s + dist_rem / eff_speed)
 
 
 def apollonius_reach_cost(
@@ -376,7 +379,7 @@ def compute_voronoi_and_apollonius_surface(
     voronoi_team_map = teams[voronoi_owner_idx]      # (H, W) con valores 1 o 2
 
     # 2. APOLONIO DINÁMICO: Tiempo de llegada T_i(x, y) con desplazamiento inercial + velocidad
-    t_reac = 0.20
+    t_reac = 0.22
     vmax = 9.2
     inert_x = pos_x + vel_x * t_reac
     inert_y = pos_y + vel_y * t_reac
@@ -389,8 +392,12 @@ def compute_voronoi_and_apollonius_surface(
     dot_dir = (vel_x[:, None, None] * dx_apo + vel_y[:, None, None] * dy_apo) / (
         np.maximum(speed_curr, 0.1) * dist_apo
     )
-    eff_speed = np.clip(vmax + 0.28 * speed_curr * dot_dir, 4.0, 11.5)
-    arrival_time = t_reac + dist_apo / eff_speed  # (N, H, W)
+    forward_boost = np.maximum(0.0, dot_dir)
+    backward_align = np.maximum(0.0, -dot_dir)
+
+    eff_speed = vmax + 0.24 * speed_curr * forward_boost
+    turn_penalty = 0.30 * backward_align * (speed_curr / vmax)
+    arrival_time = t_reac + turn_penalty + dist_apo / eff_speed  # (N, H, W)
 
     apollonius_owner_idx = np.argmin(arrival_time, axis=0)  # (H, W)
     apollonius_team_map = teams[apollonius_owner_idx]      # (H, W)
@@ -422,3 +429,4 @@ def compute_voronoi_and_apollonius_surface(
         "team_a_voronoi_pct": team_a_vor_pct,
         "team_b_voronoi_pct": team_b_vor_pct,
     }
+
