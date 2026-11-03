@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.detector import SoccerInferenceEngine, load_yaml_config
-from src.homography import HomographyStabilizer, pixel_to_pitch
+from src.homography import HomographyStabilizer, HomographyFrameResult, pixel_to_pitch
 from src.appearance import TeamClusterer, JerseyNumberRecognizer
 from src.tracker_2d import PitchBoTSORT2D
 from src.tracklet_stitcher import GlobalTrackletStitcher
@@ -84,6 +84,7 @@ class Soccer2DTrackingPipeline:
         self.tracker_2d = PitchBoTSORT2D(config=self.config)
         self.ball_tracker = BallPhysicsTracker(config=self.config)
         self.renderer = Tactical2DRenderer(config=self.config)
+        self._last_homog_res: Optional[HomographyFrameResult] = None
 
     def _reset_all_states(self) -> None:
         self.stabilizer.reset_temporal_state()
@@ -92,6 +93,7 @@ class Soccer2DTrackingPipeline:
         self.tracker_2d.reset()
         self.ball_tracker.reset()
         self.renderer.reset_trails()
+        self._last_homog_res = None
 
     def infer_single_frame_pass1(
         self,
@@ -104,31 +106,137 @@ class Soccer2DTrackingPipeline:
         Ejecuta la Pasada 1 sobre un fotograma:
         Inferencia YOLO + ROI Dinámico de Balón (conf>=0.15) + Homografía MAGSAC++
         + Equipo CIE-LAB + EasyOCR + Kalman 2D (Jugadores) + Máquina de Estados (Balón).
+        Incluye:
+          - Pre-chequeo ultra-rápido de histograma/césped (submuestreado ::4) para omitir
+            inferencias innecesarias en tomas cerradas/intros.
+          - Stride adaptativo de Keypoints cuando la homografía ya está enganchada y estable.
         """
         h_img, w_img = frame_bgr.shape[:2]
+
+        # 0. Pre-evaluar histograma/césped (< 0.15 ms) en video para detectar cortes o tomas sin cancha
+        pre_hist: Optional[tuple] = None
+        shot_cut_hist = False
+        green_ratio = 1.0
+        if is_video:
+            shot_cut_hist, hist_diff, green_ratio = self.stabilizer.check_closeup_method_2_histogram(frame_bgr)
+            pre_hist = (shot_cut_hist, hist_diff, green_ratio)
+
+            # Si casi no hay césped en pantalla (< 12%), es una toma cerrada/intro:
+            # salir de inmediato sin disparar los 3 modelos en GPU/CPU.
+            if green_ratio < self.stabilizer.c2_min_green_ratio:
+                self.stabilizer.reset_temporal_state()
+                self._last_homog_res = None
+                homog_closeup = HomographyFrameResult(
+                    H=None,
+                    H_inv=None,
+                    is_valid=False,
+                    is_closeup_or_cut=True,
+                    status_message=f"TOMA CERRADA (Cesped={green_ratio:.0%})",
+                    shot_cut_histogram=shot_cut_hist,
+                    histogram_diff=hist_diff,
+                    green_ratio=green_ratio,
+                )
+                self.tracker_2d.update_frame(
+                    frame_idx=frame_idx, fps=fps, players=[], homography_valid=False, shot_cut=True
+                )
+                self.ball_tracker.update(
+                    frame_idx=frame_idx,
+                    fps=fps,
+                    candidates=[],
+                    players=[],
+                    homography_H=None,
+                    homography_valid=False,
+                    shot_cut=True,
+                    roi_used=False,
+                )
+                return {"players": [], "balls": [], "homography": homog_closeup}
 
         # 1. Inferencia de Jugadores (conf = 0.5)
         players = self.detector.infer_players(frame_bgr, is_video=is_video)
 
-        # 2. Inferencia de los 30 Keypoints (excluyendo cajas de jugadores)
-        player_boxes = [p["bbox"] for p in players]
-        raw_kps = self.detector.infer_keypoints(frame_bgr, exclude_player_boxes=player_boxes)
+        # Si no se detectó ningún jugador en toda la imagen en video, tampoco es una toma abierta de juego:
+        # evitar correr Keypoints y Balón innecesariamente.
+        if is_video and len(players) == 0:
+            self._last_homog_res = None
+            homog_empty = HomographyFrameResult(
+                H=None,
+                H_inv=None,
+                is_valid=False,
+                is_closeup_or_cut=True,
+                status_message="SIN JUGADORES EN CANCHA (0 KPs)",
+                shot_cut_histogram=shot_cut_hist,
+                green_ratio=green_ratio,
+            )
+            self.tracker_2d.update_frame(
+                frame_idx=frame_idx, fps=fps, players=[], homography_valid=False, shot_cut=shot_cut_hist
+            )
+            self.ball_tracker.update(
+                frame_idx=frame_idx,
+                fps=fps,
+                candidates=[],
+                players=[],
+                homography_H=None,
+                homography_valid=False,
+                shot_cut=shot_cut_hist,
+                roi_used=False,
+            )
+            return {"players": [], "balls": [], "homography": homog_empty}
 
-        # 3. Homografía 2D con MAGSAC++ y validación geométrica/topológica
-        homog_res = self.stabilizer.process_frame(frame_bgr, raw_kps, is_video=is_video)
+        # 2. Inferencia Adaptativa de los 30 Keypoints + Homografía 2D con MAGSAC++
+        kp_stride = 3 if fps >= 45.0 else 2
+        can_reuse_homog = (
+            is_video
+            and not shot_cut_hist
+            and self._last_homog_res is not None
+            and self._last_homog_res.is_valid
+            and self._last_homog_res.H is not None
+            and self._last_homog_res.num_inliers >= 6
+            and (frame_idx % kp_stride != 0)
+        )
+
+        if can_reuse_homog:
+            prev_h = self._last_homog_res
+            homog_res = HomographyFrameResult(
+                H=prev_h.H,
+                H_inv=prev_h.H_inv,
+                is_valid=True,
+                is_closeup_or_cut=False,
+                status_message=prev_h.status_message,
+                shot_cut_histogram=False,
+                proximity_switch_triggered=False,
+                histogram_diff=pre_hist[1] if pre_hist else 0.0,
+                green_ratio=green_ratio,
+                num_detected=prev_h.num_detected,
+                num_inliers=prev_h.num_inliers,
+                num_discarded=prev_h.num_discarded,
+                inlier_ratio=prev_h.inlier_ratio,
+                mean_reproj_error_px=prev_h.mean_reproj_error_px,
+                keypoints=prev_h.keypoints,
+            )
+        else:
+            player_boxes = [p["bbox"] for p in players]
+            raw_kps = self.detector.infer_keypoints(frame_bgr, exclude_player_boxes=player_boxes)
+            homog_res = self.stabilizer.process_frame(
+                frame_bgr, raw_kps, is_video=is_video, precomputed_hist=pre_hist
+            )
+            self._last_homog_res = homog_res if homog_res.is_valid else None
+
         shot_cut = bool(homog_res.shot_cut_histogram or homog_res.proximity_switch_triggered)
 
-        # 4. Proyectar posiciones crudas de pies de jugadores a coordenadas 2D de cancha (metros)
-        if homog_res.is_valid and homog_res.H is not None:
-            for p in players:
-                fx, fy = p["foot_px"]
-                p["pitch_m"] = pixel_to_pitch(fx, fy, homog_res.H)
+        # 3. Proyección vectorizada de posiciones crudas de pies de jugadores a coordenadas 2D (metros)
+        if homog_res.is_valid and homog_res.H is not None and players:
+            feet_arr = np.array([[p["foot_px"]] for p in players], dtype=np.float32)
+            proj_arr = cv2.perspectiveTransform(feet_arr, homog_res.H).reshape(-1, 2)
+            for idx_p, p in enumerate(players):
+                mx, my = float(proj_arr[idx_p, 0]), float(proj_arr[idx_p, 1])
+                if np.isfinite(mx) and np.isfinite(my):
+                    p["pitch_m"] = (mx, my)
 
-        # 5. Clasificación de Equipo (CIE-LAB sin césped) y Lectura Oportunista de Dorsal (EasyOCR)
+        # 4. Clasificación de Equipo (CIE-LAB sin césped) y Lectura Oportunista de Dorsal (EasyOCR)
         self.team_clusterer.classify_players(frame_bgr, players)
         self.jersey_recognizer.recognize_frame_jerseys(frame_bgr, players, frame_idx=frame_idx)
 
-        # 6. BoT-SORT modificado con Filtro de Kalman 2D en cancha y registro tabular
+        # 5. BoT-SORT modificado con Filtro de Kalman 2D en cancha y registro tabular
         if is_video:
             players = self.tracker_2d.update_frame(
                 frame_idx=frame_idx,
@@ -138,17 +246,30 @@ class Soccer2DTrackingPipeline:
                 shot_cut=shot_cut,
             )
 
-        # 7. Seguimiento Avanzado de Balón: ROI Dinámico + Verosimilitud (conf>=0.15) + FSM
+        # 6. Seguimiento Avanzado de Balón: ROI Dinámico + Verosimilitud (conf>=0.15) + FSM
         if is_video:
             force_full_scan = shot_cut or (
                 self.ball_tracker.missing_frames >= 3 and self.ball_tracker.missing_frames % 3 == 0
             )
             roi_box = None if force_full_scan else self.ball_tracker.get_dynamic_roi(w_img, h_img)
-            ball_cands, roi_used = self.detector.infer_ball_candidates(
-                frame_bgr,
-                conf_low=self.ball_tracker.conf_low,
-                roi_box=roi_box,
+
+            # En videos de alta tasa (>= 45 FPS), cuando no hay ROI (estado LOST),
+            # escanear Full-Frame en cuadros alternos (30 Hz) para duplicar velocidad de búsqueda
+            skip_lost_full_scan = (
+                roi_box is None
+                and self.ball_tracker.state.value == "LOST"
+                and fps >= 45.0
+                and (frame_idx % 2 == 0)
             )
+            if skip_lost_full_scan:
+                ball_cands, roi_used = [], False
+            else:
+                ball_cands, roi_used = self.detector.infer_ball_candidates(
+                    frame_bgr,
+                    conf_low=self.ball_tracker.conf_low,
+                    roi_box=roi_box,
+                )
+
             tracked_ball = self.ball_tracker.update(
                 frame_idx=frame_idx,
                 fps=fps,

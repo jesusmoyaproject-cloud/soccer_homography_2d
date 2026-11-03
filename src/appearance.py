@@ -41,14 +41,15 @@ def _extract_non_grass_torso_lab(
 
     crop_bgr = frame_bgr[cy1:cy2, cx1:cx2]
     hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
-    # Máscara de césped verde (Hue 28..92)
-    grass_mask = cv2.inRange(hsv, np.array([28, 35, 35]), np.array([92, 255, 255]))
+    # Máscara amplia de césped verde y sombra de césped (Hue 24..96, Sat >= 22)
+    grass_mask = cv2.inRange(hsv, np.array([24, 22, 20]), np.array([96, 255, 255]))
     valid_mask = grass_mask == 0
 
-    if np.count_nonzero(valid_mask) < 12:
-        valid_bgr = crop_bgr.reshape(-1, 3)
-    else:
-        valid_bgr = crop_bgr[valid_mask]
+    n_valid = int(np.count_nonzero(valid_mask))
+    if n_valid < 6:
+        # Si casi todo el recorte es césped (caja muy pequeña o descentrada), no contaminar el buffer
+        return None
+    valid_bgr = crop_bgr[valid_mask]
 
     med_bgr = np.median(valid_bgr, axis=0)
     bgr_tuple = (int(med_bgr[0]), int(med_bgr[1]), int(med_bgr[2]))

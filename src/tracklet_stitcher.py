@@ -396,11 +396,13 @@ class GlobalTrackletStitcher:
                 speeds_in_chain.append(float(rec.get("speed_mps", 0.0)))
                 confs_in_chain.append(float(rec.get("conf", 0.75)))
 
-            # Construir metadatos de enlaces para identity_manifest.json
+            # Construir metadatos de enlaces para identity_manifest.json (excluyendo auto-enlaces del mismo raw_track_id)
             links_info: List[Dict[str, Any]] = []
             for k_idx in range(len(chain) - 1):
                 sa = summaries[chain[k_idx]]
                 sb = summaries[chain[k_idx + 1]]
+                if int(sa.raw_track_id) == int(sb.raw_track_id):
+                    continue
                 gap_f = max(0, int(sb.start_frame - sa.end_frame))
                 gap_s = round(gap_f / self.fps, 4)
                 sp_dist = (
@@ -425,7 +427,7 @@ class GlobalTrackletStitcher:
             last_f = int(summaries[chain[-1]].end_frame)
             avg_spd = round(float(np.mean(speeds_in_chain)), 2) if speeds_in_chain else 0.0
             avg_conf = round(float(np.mean(confs_in_chain)), 4) if confs_in_chain else 0.80
-            is_multi = len(chain) > 1
+            is_multi = len(raw_tids_ordered) > 1
             identities_manifest.append(
                 {
                     "identity_id": f"ID_{global_id:04d}",
@@ -435,7 +437,7 @@ class GlobalTrackletStitcher:
                     "confidence_score": avg_conf,
                     "track_ids": [int(global_id)] if not is_multi else ([int(global_id)] + [t for t in raw_tids_ordered if t != int(global_id)]),
                     "raw_track_ids": raw_tids_ordered,
-                    "segment_count": len(chain),
+                    "segment_count": len(raw_tids_ordered),
                     "frame_span": {
                         "first_frame": first_f,
                         "last_frame": last_f,

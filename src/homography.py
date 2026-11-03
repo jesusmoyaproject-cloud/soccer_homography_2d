@@ -692,6 +692,7 @@ class HomographyStabilizer:
         frame_bgr: np.ndarray,
         raw_keypoints: Dict[int, Tuple[float, float, float]],
         is_video: bool = True,
+        precomputed_hist: Optional[Tuple[bool, float, float]] = None,
     ) -> HomographyFrameResult:
         """
         Procesa las detecciones de keypoints de un fotograma ejecutando:
@@ -720,7 +721,10 @@ class HomographyStabilizer:
         pan_delta = (0.0, 0.0)
 
         if is_video and frame_bgr is not None:
-            shot_cut_hist, hist_diff, green_ratio = self.check_closeup_method_2_histogram(frame_bgr)
+            if precomputed_hist is not None:
+                shot_cut_hist, hist_diff, green_ratio = precomputed_hist
+            else:
+                shot_cut_hist, hist_diff, green_ratio = self.check_closeup_method_2_histogram(frame_bgr)
             raw_for_switch = {k: (v[0], v[1], v[2]) for k, v in mapped_raw.items()}
             pan_delta = self.estimate_camera_pan_delta(raw_for_switch)
             proximity_switch, _ = self.check_closeup_method_1_proximity_switch(raw_for_switch, pan_delta=pan_delta)
