@@ -296,28 +296,72 @@ class GlobalTrackletStitcher:
         summaries = self._build_fragment_summaries(records, fragments)
         frag_ids = sorted(summaries.keys(), key=lambda fid: (summaries[fid].start_frame, fid))
 
-        # Paso 3: Grafo de Cosido Global mediante Asignación Húngara iterativa
+        # Paso 3: Grafo de Cosido Global mediante búsqueda temporal acotada + Asignación Húngara por componentes
         n = len(frag_ids)
         next_link: Dict[int, int] = {}
         prev_link: Dict[int, int] = {}
+        candidates_evaluated = 0
 
         if n >= 2:
-            cost_matrix = np.full((n, n), 1e6, dtype=np.float64)
+            max_gap_frames = int(self.max_stitch_gap_sec * self.fps) + 2
+            start_frames_arr = [summaries[fid].start_frame for fid in frag_ids]
+
+            # Agrupar fragmentos con dorsal confirmado para enlaces de largo alcance
+            by_jersey: Dict[str, List[int]] = defaultdict(list)
+            for idx_f, fid in enumerate(frag_ids):
+                cj = summaries[fid].confirmed_jersey
+                if cj:
+                    by_jersey[cj].append(idx_f)
+
+            candidate_edges: List[Tuple[int, int, float]] = []
+            import bisect
+
             for i, fid_a in enumerate(frag_ids):
-                for j, fid_b in enumerate(frag_ids):
+                sa = summaries[fid_a]
+                # Rango temporal [end_frame + 1, end_frame + max_gap_frames]
+                j_start = bisect.bisect_right(start_frames_arr, sa.end_frame)
+                j_end = bisect.bisect_right(start_frames_arr, sa.end_frame + max_gap_frames)
+
+                checked_j = set()
+                for j in range(j_start, j_end):
                     if i == j:
                         continue
-                    c = self._compute_stitch_cost(summaries[fid_a], summaries[fid_b])
+                    checked_j.add(j)
+                    candidates_evaluated += 1
+                    c = self._compute_stitch_cost(sa, summaries[frag_ids[j]])
                     if c < 1e5:
-                        cost_matrix[i, j] = c
+                        candidate_edges.append((i, j, c))
 
-            row_ind, col_ind = linear_sum_assignment(cost_matrix)
-            for r, c in zip(row_ind, col_ind):
-                if cost_matrix[r, c] < 1e5:
-                    fid_a = frag_ids[r]
-                    fid_b = frag_ids[c]
-                    next_link[fid_a] = fid_b
-                    prev_link[fid_b] = fid_a
+                # También evaluar fragmentos posteriores con el mismo dorsal confirmado fuera de la ventana corta
+                if sa.confirmed_jersey and sa.confirmed_jersey in by_jersey:
+                    for j in by_jersey[sa.confirmed_jersey]:
+                        if j > i and j not in checked_j:
+                            candidates_evaluated += 1
+                            c = self._compute_stitch_cost(sa, summaries[frag_ids[j]])
+                            if c < 1e5:
+                                candidate_edges.append((i, j, c))
+
+            if candidate_edges:
+                if n <= 800:
+                    cost_matrix = np.full((n, n), 1e6, dtype=np.float64)
+                    for i, j, c in candidate_edges:
+                        cost_matrix[i, j] = c
+                    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+                    for r, c_idx in zip(row_ind, col_ind):
+                        if cost_matrix[r, c_idx] < 1e5:
+                            fid_a = frag_ids[r]
+                            fid_b = frag_ids[c_idx]
+                            next_link[fid_a] = fid_b
+                            prev_link[fid_b] = fid_a
+                else:
+                    # Para videos largos (ej. 30,000+ fragmentos), asignación óptima voraz ordenada por costo
+                    candidate_edges.sort(key=lambda item: item[2])
+                    for i, j, c in candidate_edges:
+                        fid_a = frag_ids[i]
+                        fid_b = frag_ids[j]
+                        if fid_a not in next_link and fid_b not in prev_link:
+                            next_link[fid_a] = fid_b
+                            prev_link[fid_b] = fid_a
 
         # Paso 4: Construir cadenas conexas de fragmentos (caminos desde raíces sin prev_link)
         chains: List[List[int]] = []
@@ -500,6 +544,7 @@ class GlobalTrackletStitcher:
             "raw_tracklets": len(fragments),
             "stitched_players": len(chains),
             "merges_performed": merges_count,
+            "candidates_evaluated": candidates_evaluated,
             "jerseys_assigned": jerseys_assigned_count,
             "total_rows": len(stitched_records),
             "identities_manifest": identities_manifest,

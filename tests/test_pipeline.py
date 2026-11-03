@@ -678,33 +678,45 @@ def test_pass2_homography_reconciliation_and_scouting_json_exporter(tmp_path):
     assert paths["consolidation_report"].exists()
 
     meta_data = json.loads(paths["match_metadata"].read_text(encoding="utf-8"))
-    track_data = json.loads(paths["tracking_output"].read_text(encoding="utf-8"))
+    raw_track_text = paths["tracking_output"].read_text(encoding="utf-8")
+    track_data = json.loads(raw_track_text)
 
-    # Validar contrato esperado por scoutingData_FrontEnd
+    # Verificar que tracking_output.json se exporta compacto (sin saltos de línea ni indentación)
+    assert "\n" not in raw_track_text
+
+    # Validar contrato esperado por scoutingData_FrontEnd y ProcessingEventing_v2
+    assert "pitch" in meta_data
+    assert meta_data["pitch"]["dimensions_m"]["length"] == 105.0
+    assert "vector_elements" in meta_data["pitch"]
     assert meta_data["teams"]["team_a"]["id"] == 0
     assert meta_data["teams"]["team_b"]["id"] == 1
     assert meta_data["teams"]["referee"]["id"] == -1
+    assert meta_data["teams"]["0"]["primary_color_hex"].startswith("#")
+    assert meta_data["teams"]["1"]["primary_color_hex"].startswith("#")
     assert meta_data["teams"]["team_a"]["color_hex"].startswith("#")
+    assert "events" in track_data and isinstance(track_data["events"], list)
+    assert track_data["metadata"]["fps"] == 25.0
     assert len(track_data["frames"]) == 3
 
     f1 = track_data["frames"][0]
     assert f1["frame"] == 1
     assert f1["homography"]["valid"] is True
     assert len(f1["homography"]["matrix"]) == 3
-    assert len(f1["homography"]["inv_matrix"]) == 3
+    assert "inv_matrix" not in f1["homography"]
     assert f1["players"][0]["track_id"] == 1
     assert f1["players"][0]["team_id"] == 0
     assert f1["players"][0]["shirt_number"] == "10"
+    assert "team_color" not in f1["players"][0]
     assert f1["players"][1]["team_id"] == -1
     assert f1["players"][1]["role"] == "referee"
-    assert f1["ball"]["carrier_track_id"] == 1
+    assert "shirt_number" not in f1["players"][1]
+    assert f1["ball"]["detected"] is True
     assert f1["possession"]["possessor_id"] == 1
     assert f1["possession"]["team_id"] == 0
 
     f2 = track_data["frames"][1]
     assert f2["homography"]["valid"] is True
-    assert f2["homography"]["is_interpolated"] is True
-    assert f2["ball"]["state"] == "RECONSTRUCTED_APOLLONIUS_TOUCH"
+    assert f2["ball"]["is_interpolated"] is True
 
 
 def test_gpu_letterbox_and_pre_associate_frame():
