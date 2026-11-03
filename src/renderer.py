@@ -418,8 +418,9 @@ class Tactical2DRenderer:
                     (tip_x, tip_y),
                     (255, 255, 255),
                     2,
-                    lineType=cv2.LINE_AA,
-                    tipLength=0.32,
+                    cv2.LINE_AA,
+                    0,
+                    0.32,
                 )
 
             cv2.circle(plane, (px, py), 8, col, -1, lineType=cv2.LINE_AA)

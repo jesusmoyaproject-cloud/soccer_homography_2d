@@ -455,6 +455,15 @@ def test_voronoi_and_apollonius_geometry_player_and_ball():
     assert carrier is not None
     assert carrier["id"] == 10
 
+    # 3. Verificar que Tactical2DRenderer.render_2d_plane dibuja el mapa de Voronoi/Apolonio y flechas sin error
+    from src.renderer import Tactical2DRenderer
+    from src.homography import HomographyFrameResult
+    renderer = Tactical2DRenderer()
+    dummy_h = HomographyFrameResult(H=np.eye(3), H_inv=np.eye(3), is_valid=True, is_closeup_or_cut=False, status_message="OK")
+    plane_img = renderer.render_2d_plane(players_field, [], dummy_h, update_trails=True)
+    assert plane_img is not None and plane_img.shape[0] > 100
+
+
 
 
 
