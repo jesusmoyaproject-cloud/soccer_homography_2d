@@ -140,11 +140,13 @@ class PitchBoTSORT2D:
         self.tracks_2d: Dict[int, KalmanTrack2D] = {}
         self.raw_to_canonical_id: Dict[int, int] = {}
         self.tabular_records: List[Dict[str, Any]] = []
+        self._max_canonical_id: int = 0
 
     def reset(self) -> None:
         self.tracks_2d.clear()
         self.raw_to_canonical_id.clear()
         self.tabular_records.clear()
+        self._max_canonical_id = 0
 
     def update_frame(
         self,
@@ -310,7 +312,8 @@ class PitchBoTSORT2D:
             raw_id = int(p["id"])
             can_id = raw_id
             if can_id in active_canonical_ids_in_frame:
-                can_id = max(list(self.tracks_2d.keys()) + [raw_id]) + 1
+                can_id = max(self._max_canonical_id, raw_id) + 1
+            self._max_canonical_id = max(self._max_canonical_id, can_id, raw_id)
             self.raw_to_canonical_id[raw_id] = can_id
             p["raw_track_id"] = raw_id
             p["id"] = can_id
@@ -332,10 +335,15 @@ class PitchBoTSORT2D:
                 )
             active_canonical_ids_in_frame.add(can_id)
 
-        # Incrementar contador de ausencia para pistas no vistas en este frame
+        # Incrementar contador de ausencia y purgar pistas expiradas (> 2x memory_frames) para mantener O(1)
+        expired_cids = []
         for cid, trk in self.tracks_2d.items():
             if cid not in active_canonical_ids_in_frame:
                 trk.missing_frames += 1
+                if (frame_idx - trk.last_frame) > (self.memory_frames * 2):
+                    expired_cids.append(cid)
+        for cid in expired_cids:
+            self.tracks_2d.pop(cid, None)
 
         # 4. Registrar fila tabular por cada jugador para la Pasada 2 (Global Tracklet Stitching)
         for p in players:

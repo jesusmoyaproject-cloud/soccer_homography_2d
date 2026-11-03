@@ -133,7 +133,7 @@ ball_tracking:
 
 # Configuración de Visualización, Video y Plano 2D
 video:
-  max_frames: 3000               # Restricción por defecto a 3000 frames al procesar video
+  max_frames: null               # Sin límite por defecto (procesa todo el video salvo que se pase --max-frames)
 
 visualization:
   minimap_scale: 7.0             # Píxeles por metro en el plano 2D

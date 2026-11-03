@@ -382,7 +382,10 @@ class Soccer2DTrackingPipeline:
             raise RuntimeError(f"No se pudo abrir el video: {in_path}")
 
         if max_frames is None:
-            max_frames = int(self.config.get("video", {}).get("max_frames", 3000))
+            cfg_max = self.config.get("video", {}).get("max_frames")
+            max_frames = int(cfg_max) if (cfg_max is not None and int(cfg_max) > 0) else None
+        elif int(max_frames) <= 0:
+            max_frames = None
 
         fps = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -731,8 +734,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-frames", "-m",
         type=int,
-        default=3000,
-        help="Límite máximo de fotogramas a procesar en video (por defecto: 3000 frames)",
+        default=None,
+        help="Límite máximo de fotogramas a procesar en video (por defecto: sin límite, procesa todo el video)",
     )
     parser.add_argument(
         "--single-pass",
