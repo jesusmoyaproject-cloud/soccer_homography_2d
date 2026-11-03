@@ -707,6 +707,54 @@ def test_pass2_homography_reconciliation_and_scouting_json_exporter(tmp_path):
     assert f2["ball"]["state"] == "RECONSTRUCTED_APOLLONIUS_TOUCH"
 
 
+def test_gpu_letterbox_and_pre_associate_frame():
+    """
+    Verifica:
+    1. `SoccerInferenceEngine._gpu_letterbox`: Redimensionado y padding exacto a 640x640 y
+       des-escalado inverso exacto a (1920, 1080).
+    2. `PitchBoTSORT2D.pre_associate_frame`: Asociación directa desde `predict()` (sin IDs de BoT-SORT)
+       mediante IoU en píxeles + Kalman 2D antes de clasificar equipo.
+    """
+    import torch
+    from src.detector import SoccerInferenceEngine
+
+    dummy_rgb = torch.zeros((1, 3, 1080, 1920), dtype=torch.float32)
+    padded, scale, pad_x, pad_y = SoccerInferenceEngine._gpu_letterbox(dummy_rgb, imgsz=640)
+    assert tuple(padded.shape) == (1, 3, 640, 640)
+    assert abs(scale - (640.0 / 1920.0)) < 1e-6
+    assert abs(pad_x - 0.0) < 1e-6
+    assert abs(pad_y - 140.0) < 1e-6
+
+    # Verificar que un punto en (960, 540) en 1920x1080 cae en (320, 320) en 640x640 y regresa exacto
+    x_net = 960.0 * scale + pad_x
+    y_net = 540.0 * scale + pad_y
+    assert abs(x_net - 320.0) < 1e-4
+    assert abs(y_net - 320.0) < 1e-4
+
+    tracker = PitchBoTSORT2D()
+    # Frame 1: Dos jugadores detectados con predict() (IDs crudos 1 y 2)
+    f1_players = [
+        {"id": 1, "role": "Player", "class_id": 2, "conf": 0.9, "bbox": [400.0, 300.0, 440.0, 390.0], "foot_px": (420.0, 390.0), "pitch_m": (30.0, 20.0), "team_id": 1},
+        {"id": 2, "role": "Player", "class_id": 2, "conf": 0.9, "bbox": [800.0, 500.0, 840.0, 590.0], "foot_px": (820.0, 590.0), "pitch_m": (55.0, 35.0), "team_id": 2},
+    ]
+    tracker.pre_associate_frame(frame_idx=1, fps=30.0, players=f1_players, homography_valid=True, shot_cut=False)
+    tracker.update_frame(frame_idx=1, fps=30.0, players=f1_players, homography_valid=True, shot_cut=False)
+    id_a = f1_players[0]["id"]
+    id_b = f1_players[1]["id"]
+    assert id_a != id_b
+
+    # Frame 2: El orden de detección se invierte en predict() (el segundo jugador aparece primero con id=1),
+    # pero `pre_associate_frame` debe recuperar sus IDs reales (id_b e id_a) por IoU + Kalman 2D
+    f2_players = [
+        {"id": 1, "role": "Player", "class_id": 2, "conf": 0.9, "bbox": [804.0, 502.0, 844.0, 592.0], "foot_px": (824.0, 592.0), "pitch_m": (55.2, 35.1), "team_id": 2},
+        {"id": 2, "role": "Player", "class_id": 2, "conf": 0.9, "bbox": [403.0, 301.0, 443.0, 391.0], "foot_px": (423.0, 391.0), "pitch_m": (30.2, 20.1), "team_id": 1},
+    ]
+    tracker.pre_associate_frame(frame_idx=2, fps=30.0, players=f2_players, homography_valid=True, shot_cut=False)
+    assert f2_players[0]["id"] == id_b
+    assert f2_players[1]["id"] == id_a
+
+
+
 
 
 

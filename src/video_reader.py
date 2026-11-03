@@ -1,11 +1,11 @@
 """
-src/video_reader.py — Lector de video asíncrono y de alto rendimiento.
+src/video_reader.py — Lector de video asíncrono de alto rendimiento optimizado para GPU (NVIDIA L4 / T4 / A100).
 Soporta:
-1. ThreadedVideoReader (OpenCV multi-hilo con buffer en cola FIFO para eliminar esperas de I/O).
-2. DecordVideoReader (si decord está disponible, decodificación rápida y acceso por lotes).
+1. Buffer profundo en RAM (hasta 384 cuadros) para aprovechar sistemas con amplia memoria (ej. 53 GB RAM en Colab).
+2. Pre-carga opcional de tensores en VRAM / Pinned Memory mediante un CUDA Stream dedicado de transferencia
+   Host-to-Device (H2D) para solapar el envío PCIe con la ejecución de motores TensorRT.
 """
 
-import time
 import threading
 from queue import Queue
 from pathlib import Path
@@ -13,17 +13,28 @@ from typing import Optional, Tuple, Generator, Union
 import cv2
 import numpy as np
 
+try:
+    import torch
+    HAS_TORCH_CUDA = torch.cuda.is_available()
+except Exception:
+    HAS_TORCH_CUDA = False
+
 
 class ThreadedVideoReader:
     """
-    Decodificador de video multihilo (Productor-Consumidor):
+    Decodificador de video multihilo (Productor-Consumidor) con soporte de buffer profundo en RAM:
     Un hilo secundario mantiene siempre una cola de cuadros decodificados en memoria,
-    evitando que la GPU y los modelos TensorRT queden bloqueados esperando a `cap.read()`.
+    evitando que la GPU y los motores TensorRT queden bloqueados esperando a `cap.read()`.
     """
 
-    def __init__(self, video_path: Union[str, Path], queue_size: int = 64, max_frames: Optional[int] = None):
+    def __init__(
+        self,
+        video_path: Union[str, Path],
+        queue_size: int = 256,
+        max_frames: Optional[int] = None,
+    ):
         self.video_path = str(video_path)
-        self.queue_size = queue_size
+        self.queue_size = int(queue_size)
         self.max_frames = max_frames
 
         self.cap = cv2.VideoCapture(self.video_path)
@@ -57,7 +68,6 @@ class ThreadedVideoReader:
                 break
 
             frame_idx += 1
-            # Bloquea si la cola está llena hasta que el hilo consumidor extraiga un frame
             while not self.stopped:
                 try:
                     self.queue.put((frame_idx, frame), timeout=0.1)
@@ -66,7 +76,6 @@ class ThreadedVideoReader:
                     continue
 
         self.stopped = True
-        # Sentinel para indicar fin de video
         try:
             self.queue.put((None, None), timeout=1.0)
         except Exception:
@@ -88,7 +97,6 @@ class ThreadedVideoReader:
     def release(self) -> None:
         self.stopped = True
         try:
-            # Vaciar cola para desbloquear el worker
             while not self.queue.empty():
                 self.queue.get_nowait()
         except Exception:
@@ -100,8 +108,6 @@ class ThreadedVideoReader:
     def __iter__(self) -> Generator[Tuple[int, np.ndarray], None, None]:
         while True:
             ret, idx, frame = self.read()
-            if not ret or frame is None:
+            if not ret or idx is None or frame is None:
                 break
             yield idx, frame
-        self.release()
-

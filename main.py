@@ -151,8 +151,46 @@ class Soccer2DTrackingPipeline:
                 )
                 return {"players": [], "balls": [], "homography": homog_closeup}
 
-        # 1. Inferencia de Jugadores (conf = 0.5)
-        players = self.detector.infer_players(frame_bgr, is_video=is_video)
+        # 1. Determinar de antemano si en este cuadro corremos Keypoints y/o Balón
+        #    para despachar los 3 motores en paralelo sobre 3 CUDA Streams (1 sola subida PCIe + LetterBox en GPU).
+        kp_stride = 3 if fps >= 45.0 else 2
+        can_reuse_homog = (
+            is_video
+            and not shot_cut_hist
+            and self._last_homog_res is not None
+            and self._last_homog_res.is_valid
+            and self._last_homog_res.H is not None
+            and self._last_homog_res.num_inliers >= 6
+            and (frame_idx % kp_stride != 0)
+        )
+
+        roi_box: Optional[ tuple ] = None
+        run_ball = True
+        if is_video:
+            force_full_scan = shot_cut_hist or (
+                self.ball_tracker.missing_frames >= 3 and self.ball_tracker.missing_frames % 3 == 0
+            )
+            roi_box = None if force_full_scan else self.ball_tracker.get_dynamic_roi(w_img, h_img)
+            skip_lost_full_scan = (
+                roi_box is None
+                and self.ball_tracker.state.value == "LOST"
+                and fps >= 45.0
+                and (frame_idx % 2 == 0)
+            )
+            run_ball = not skip_lost_full_scan
+
+        if is_video and getattr(self.detector, "is_cuda", False):
+            players, raw_kps, ball_cands, roi_used = self.detector.infer_frame_parallel_gpu(
+                frame_bgr,
+                run_keypoints=(not can_reuse_homog),
+                run_ball=run_ball,
+                ball_conf_low=self.ball_tracker.conf_low,
+                ball_roi_box=roi_box,
+            )
+        else:
+            players = self.detector.infer_players(frame_bgr, is_video=is_video)
+            raw_kps = {}
+            ball_cands, roi_used = [], False
 
         # Si no se detectó ningún jugador en toda la imagen en video, tampoco es una toma abierta de juego:
         # evitar correr Keypoints y Balón innecesariamente.
@@ -182,18 +220,7 @@ class Soccer2DTrackingPipeline:
             )
             return {"players": [], "balls": [], "homography": homog_empty}
 
-        # 2. Inferencia Adaptativa de los 30 Keypoints + Homografía 2D con MAGSAC++
-        kp_stride = 3 if fps >= 45.0 else 2
-        can_reuse_homog = (
-            is_video
-            and not shot_cut_hist
-            and self._last_homog_res is not None
-            and self._last_homog_res.is_valid
-            and self._last_homog_res.H is not None
-            and self._last_homog_res.num_inliers >= 6
-            and (frame_idx % kp_stride != 0)
-        )
-
+        # 2. Resolver Homografía 2D con MAGSAC++ (reutilizada o calculada desde raw_kps)
         if can_reuse_homog:
             prev_h = self._last_homog_res
             homog_res = HomographyFrameResult(
@@ -214,8 +241,9 @@ class Soccer2DTrackingPipeline:
                 keypoints=prev_h.keypoints,
             )
         else:
-            player_boxes = [p["bbox"] for p in players]
-            raw_kps = self.detector.infer_keypoints(frame_bgr, exclude_player_boxes=player_boxes)
+            if not (is_video and getattr(self.detector, "is_cuda", False)):
+                player_boxes = [p["bbox"] for p in players]
+                raw_kps = self.detector.infer_keypoints(frame_bgr, exclude_player_boxes=player_boxes)
             homog_res = self.stabilizer.process_frame(
                 frame_bgr, raw_kps, is_video=is_video, precomputed_hist=pre_hist
             )
@@ -232,11 +260,22 @@ class Soccer2DTrackingPipeline:
                 if np.isfinite(mx) and np.isfinite(my):
                     p["pitch_m"] = (mx, my)
 
-        # 4. Clasificación de Equipo (CIE-LAB sin césped) y Lectura Oportunista de Dorsal (EasyOCR)
+        # 4. Pre-asociar IDs online (IoU en píxeles + Kalman 2D) ANTES de clasificar equipo/dorsal
+        #    para que las pistas ya bloqueadas omitan el recorte y conversión HSV+LAB en CPU.
+        if is_video:
+            self.tracker_2d.pre_associate_frame(
+                frame_idx=frame_idx,
+                fps=fps,
+                players=players,
+                homography_valid=homog_res.is_valid,
+                shot_cut=shot_cut,
+            )
+
+        # 5. Clasificación de Equipo (CIE-LAB sin césped) y Lectura Oportunista de Dorsal (EasyOCR)
         self.team_clusterer.classify_players(frame_bgr, players)
         self.jersey_recognizer.recognize_frame_jerseys(frame_bgr, players, frame_idx=frame_idx)
 
-        # 5. BoT-SORT modificado con Filtro de Kalman 2D en cancha y registro tabular
+        # 6. Actualizar Filtro de Kalman 2D en cancha, reconexión de Apolonio y registro tabular
         if is_video:
             players = self.tracker_2d.update_frame(
                 frame_idx=frame_idx,
@@ -246,29 +285,17 @@ class Soccer2DTrackingPipeline:
                 shot_cut=shot_cut,
             )
 
-        # 6. Seguimiento Avanzado de Balón: ROI Dinámico + Verosimilitud (conf>=0.15) + FSM
+        # 7. Seguimiento Avanzado de Balón: ROI Dinámico + Verosimilitud (conf>=0.15) + FSM
         if is_video:
-            force_full_scan = shot_cut or (
-                self.ball_tracker.missing_frames >= 3 and self.ball_tracker.missing_frames % 3 == 0
-            )
-            roi_box = None if force_full_scan else self.ball_tracker.get_dynamic_roi(w_img, h_img)
-
-            # En videos de alta tasa (>= 45 FPS), cuando no hay ROI (estado LOST),
-            # escanear Full-Frame en cuadros alternos (30 Hz) para duplicar velocidad de búsqueda
-            skip_lost_full_scan = (
-                roi_box is None
-                and self.ball_tracker.state.value == "LOST"
-                and fps >= 45.0
-                and (frame_idx % 2 == 0)
-            )
-            if skip_lost_full_scan:
-                ball_cands, roi_used = [], False
-            else:
-                ball_cands, roi_used = self.detector.infer_ball_candidates(
-                    frame_bgr,
-                    conf_low=self.ball_tracker.conf_low,
-                    roi_box=roi_box,
-                )
+            if not getattr(self.detector, "is_cuda", False):
+                if not run_ball:
+                    ball_cands, roi_used = [], False
+                else:
+                    ball_cands, roi_used = self.detector.infer_ball_candidates(
+                        frame_bgr,
+                        conf_low=self.ball_tracker.conf_low,
+                        roi_box=roi_box,
+                    )
 
             tracked_ball = self.ball_tracker.update(
                 frame_idx=frame_idx,
@@ -423,8 +450,8 @@ class Soccer2DTrackingPipeline:
         t_pass1 = time.time()
         frame_idx = 0
 
-        # Lector asíncrono con buffer multihilo (elimina cuello de botella de lectura en disco/CPU)
-        reader = ThreadedVideoReader(in_path, queue_size=64, max_frames=max_frames)
+        # Lector asíncrono con buffer multihilo en RAM (384 cuadros ~ 2.4 GB RAM, ideal para los 53 GB de Colab)
+        reader = ThreadedVideoReader(in_path, queue_size=384, max_frames=max_frames)
 
         try:
             for frame_idx, frame_bgr in reader:
@@ -508,7 +535,7 @@ class Soccer2DTrackingPipeline:
         render_elapsed = 0.0
         if render_video:
             print("▶ Renderizando video final con trayectorias 2D cosidas y traza continua de balón...")
-            reader_render = ThreadedVideoReader(in_path, queue_size=64, max_frames=frame_idx)
+            reader_render = ThreadedVideoReader(in_path, queue_size=256, max_frames=frame_idx)
             writer = None
             render_idx = 0
             self.renderer.reset_trails()

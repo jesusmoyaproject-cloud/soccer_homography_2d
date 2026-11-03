@@ -147,7 +147,7 @@ class TeamClusterer:
             tid = int(p["id"])
             # Si el jugador ya tiene su equipo bloqueado y el K-Means ya está calibrado,
             # reutilizar directamente sin volver a recortar ni convertir HSV/LAB en CPU.
-            if tid in self._locked_team and len(self._buffer_lab) >= 120:
+            if tid in self._locked_team and self.centroids_lab is not None and len(self._buffer_lab) >= 40:
                 team_id = self._locked_team[tid]
                 p["team_id"] = team_id
                 p["team_label"] = "Team_A" if team_id == 1 else "Team_B"
