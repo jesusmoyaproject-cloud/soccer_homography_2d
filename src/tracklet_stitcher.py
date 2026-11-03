@@ -344,17 +344,21 @@ class GlobalTrackletStitcher:
         stitched_records = [dict(r) for r in records]
         jerseys_assigned_count = 0
         merges_count = sum(len(ch) - 1 for ch in chains)
+        identities_manifest: List[Dict[str, Any]] = []
 
         for global_id, chain in enumerate(chains, start=1):
             # Combinar todos los votos de dorsal y equipo a lo largo de todos los fragmentos cosidos
             combined_jersey_votes: Dict[str, float] = defaultdict(float)
             team_votes: Dict[int, int] = defaultdict(int)
             bgr_samples: List[Tuple[int, int, int]] = []
+            raw_tids_ordered: List[int] = []
 
             for fid in chain:
                 s = summaries[fid]
                 team_votes[s.team_id] += s.num_frames
                 bgr_samples.append(s.color_bgr)
+                if s.raw_track_id not in raw_tids_ordered:
+                    raw_tids_ordered.append(int(s.raw_track_id))
                 for j_num, j_score in s.jersey_votes.items():
                     combined_jersey_votes[j_num] += j_score
 
@@ -377,6 +381,8 @@ class GlobalTrackletStitcher:
                 chain_row_indices.extend(summaries[fid].row_indices)
 
             chain_row_indices.sort(key=lambda idx: int(stitched_records[idx]["frame"]))
+            speeds_in_chain: List[float] = []
+            confs_in_chain: List[float] = []
             for r_idx in chain_row_indices:
                 rec = stitched_records[r_idx]
                 rec["global_track_id"] = int(global_id)
@@ -387,6 +393,64 @@ class GlobalTrackletStitcher:
                 rec["color_r"] = final_bgr[2]
                 rec["stitched_jersey"] = final_jersey
                 rec["is_interpolated"] = False
+                speeds_in_chain.append(float(rec.get("speed_mps", 0.0)))
+                confs_in_chain.append(float(rec.get("conf", 0.75)))
+
+            # Construir metadatos de enlaces para identity_manifest.json
+            links_info: List[Dict[str, Any]] = []
+            for k_idx in range(len(chain) - 1):
+                sa = summaries[chain[k_idx]]
+                sb = summaries[chain[k_idx + 1]]
+                gap_f = max(0, int(sb.start_frame - sa.end_frame))
+                gap_s = round(gap_f / self.fps, 4)
+                sp_dist = (
+                    round(float(np.hypot(sb.start_pos_m[0] - sa.end_pos_m[0], sb.start_pos_m[1] - sa.end_pos_m[1])), 2)
+                    if (sa.end_pos_m is not None and sb.start_pos_m is not None)
+                    else 0.0
+                )
+                raw_cost = self._compute_stitch_cost(sa, sb)
+                link_score = round(float(np.clip(1.0 / (1.0 + max(0.0, raw_cost)), 0.50, 0.99)), 4)
+                links_info.append(
+                    {
+                        "from_track_id": int(sa.raw_track_id),
+                        "to_track_id": int(sb.raw_track_id),
+                        "score": link_score,
+                        "gap_frames": gap_f,
+                        "gap_seconds": gap_s,
+                        "spatial_distance_m": sp_dist,
+                    }
+                )
+
+            first_f = int(summaries[chain[0]].start_frame)
+            last_f = int(summaries[chain[-1]].end_frame)
+            avg_spd = round(float(np.mean(speeds_in_chain)), 2) if speeds_in_chain else 0.0
+            avg_conf = round(float(np.mean(confs_in_chain)), 4) if confs_in_chain else 0.80
+            is_multi = len(chain) > 1
+            identities_manifest.append(
+                {
+                    "identity_id": f"ID_{global_id:04d}",
+                    "global_track_id": int(global_id),
+                    "status": "CONFIRMED" if (not is_multi or avg_conf >= 0.65) else "NEEDS_REVIEW",
+                    "creation_method": "AUTOMATIC",
+                    "confidence_score": avg_conf,
+                    "track_ids": [int(global_id)] if not is_multi else ([int(global_id)] + [t for t in raw_tids_ordered if t != int(global_id)]),
+                    "raw_track_ids": raw_tids_ordered,
+                    "segment_count": len(chain),
+                    "frame_span": {
+                        "first_frame": first_f,
+                        "last_frame": last_f,
+                        "total_active_frames": len(chain_row_indices),
+                    },
+                    "kinematics": {
+                        "avg_velocity_ms": avg_spd,
+                    },
+                    "links": links_info,
+                    "enrichment": {
+                        "team_id": int(final_team_id),
+                        "shirt_number": final_jersey,
+                    },
+                }
+            )
 
             # Paso 5: Interpolación lineal en el plano 2D para huecos breves entre fragmentos de la misma cadena
             interpolated_rows: List[Dict[str, Any]] = []
@@ -436,6 +500,7 @@ class GlobalTrackletStitcher:
             "merges_performed": merges_count,
             "jerseys_assigned": jerseys_assigned_count,
             "total_rows": len(stitched_records),
+            "identities_manifest": identities_manifest,
         }
         return stitched_records, stats
 

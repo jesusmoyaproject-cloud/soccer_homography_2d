@@ -30,6 +30,7 @@ from src.tracklet_stitcher import GlobalTrackletStitcher
 from src.ball_tracker import BallPhysicsTracker, BallTrajectoryReconstructor
 from src.renderer import Tactical2DRenderer
 from src.video_reader import ThreadedVideoReader
+from src.json_exporter import reconcile_homographies_pass2, ScoutingJsonExporter
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
@@ -243,11 +244,13 @@ class Soccer2DTrackingPipeline:
         video_path: Union[str, Path],
         output_path: Optional[Union[str, Path]] = None,
         max_frames: Optional[int] = None,
+        render_video: bool = True,
     ) -> Path:
         """
         Procesa un archivo de video (restringido por defecto a 3000 frames) ejecutando:
           - Pasada 1: Inferencia frame a frame + Homografía MAGSAC++ + Kalman 2D + Equipo + OCR.
-          - Pasada 2: Global Tracklet Stitching sobre datos tabulares + Renderizado final del video.
+          - Pasada 2: Sinceramiento Homográfico + Global Tracklet Stitching + Reconstrucción Balón
+                      + Exportación JSON (`match_metadata.json`, `tracking_output.json`) + Renderizado.
         """
         in_path = Path(video_path)
         if not in_path.exists():
@@ -262,6 +265,8 @@ class Soccer2DTrackingPipeline:
 
         fps = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
         target_frames = (
             min(total_frames, max_frames)
             if (max_frames and total_frames > 0)
@@ -284,13 +289,14 @@ class Soccer2DTrackingPipeline:
         if not self.enable_two_pass:
             return self._process_video_single_pass(cap, out_path, target_frames, fps, max_frames)
 
+        cap.release()
+
         # =====================================================================
         # PASADA 1: Inferencia Frame a Frame + Kalman 2D + Equipo + Dorsal OCR
         # =====================================================================
         print("▶ [PASADA 1/2] Inferencia Frame a Frame + Homografía 2D + Kalman 2D + OCR (Asíncrono)...")
         frame_cache_meta: Dict[int, Dict[str, Any]] = {}
         t_pass1 = time.time()
-        last_log_t = time.time()
         frame_idx = 0
 
         # Lector asíncrono con buffer multihilo (elimina cuello de botella de lectura en disco/CPU)
@@ -320,17 +326,29 @@ class Soccer2DTrackingPipeline:
             reader.release()
             print()
 
+        pass1_elapsed = time.time() - t_pass1
+
         # =====================================================================
-        # PASADA 2: Post-procesamiento Tabular (Jugadores + Reconstrucción de Balón)
+        # PASADA 2: Sinceramiento Homográfico + Cosido Global + Balón + JSONs
         # =====================================================================
-        print("▶ [PASADA 2/2] Ejecutando Global Tracklet Stitching y Reconstrucción Continua del Balón...")
+        print("▶ [PASADA 2/2] Ejecutando Sinceramiento Homográfico, Global Tracklet Stitching y Balón...")
         t_stitch = time.time()
+
+        # 2.1 Sincerar Homografía en huecos cortos entre planos válidos antes del cosido
+        homog_reconcile_stats = reconcile_homographies_pass2(
+            frame_cache_meta=frame_cache_meta,
+            raw_player_records=self.tracker_2d.tabular_records,
+            raw_ball_records=self.ball_tracker.tabular_records,
+            max_gap_frames=20,
+        )
+
+        # 2.2 Cosido Global de Jugadores (con región cinemática de Apolonio)
         stitcher = GlobalTrackletStitcher(config=self.config, fps=fps)
         raw_records = self.tracker_2d.tabular_records
         stitched_records, stitch_stats = stitcher.stitch_and_propagate(raw_records)
         stitched_by_frame = stitcher.build_frame_lookup(stitched_records)
 
-        # Reconstrucción Post-Inferencia de la Traza Continua del Balón
+        # 2.3 Reconstrucción Post-Inferencia de la Traza Continua del Balón
         ball_reconstructor = BallTrajectoryReconstructor(config=self.config, fps=fps)
         reconstructed_ball_rows, ball_stats = ball_reconstructor.reconstruct(
             self.ball_tracker.tabular_records,
@@ -347,6 +365,11 @@ class Soccer2DTrackingPipeline:
         stitch_elapsed = time.time() - t_stitch
 
         print(
+            f"   ✓ Homografía sincerada: {homog_reconcile_stats['valid_pass1']} válidas Pasada 1 + "
+            f"{homog_reconcile_stats['interpolated_pass2']} interpoladas Pasada 2 = "
+            f"{homog_reconcile_stats['total_valid_pass2']} cuadros con matriz 3x3 activa."
+        )
+        print(
             f"   ✓ Jugadores cosidos en {stitch_elapsed:.2f}s: "
             f"{stitch_stats['raw_tracklets']} fragmentos -> {stitch_stats['stitched_players']} identidades globales "
             f"({stitch_stats['merges_performed']} uniones, {stitch_stats['jerseys_assigned']} dorsales propagados)."
@@ -358,52 +381,101 @@ class Soccer2DTrackingPipeline:
         )
 
         # Renderizado del video final con los IDs globales cosidos y la traza continua del balón
-        print("▶ Renderizando video final con trayectorias 2D cosidas y traza continua de balón...")
-        reader_render = ThreadedVideoReader(in_path, queue_size=64, max_frames=frame_idx)
-        writer = None
-        render_idx = 0
-        self.renderer.reset_trails()
-        stab_mode = self.stabilizer.stabilization_method
-        t_rend = time.time()
+        render_elapsed = 0.0
+        if render_video:
+            print("▶ Renderizando video final con trayectorias 2D cosidas y traza continua de balón...")
+            reader_render = ThreadedVideoReader(in_path, queue_size=64, max_frames=frame_idx)
+            writer = None
+            render_idx = 0
+            self.renderer.reset_trails()
+            stab_mode = self.stabilizer.stabilization_method
+            t_rend = time.time()
 
-        try:
-            for render_idx, frame_bgr in reader_render:
-                meta = frame_cache_meta.get(render_idx)
-                if meta is None:
-                    continue
+            try:
+                for render_idx, frame_bgr in reader_render:
+                    meta = frame_cache_meta.get(render_idx)
+                    if meta is None:
+                        continue
 
-                players_stitched = stitched_by_frame.get(render_idx, [])
-                balls_reconstructed = reconstructed_balls_by_frame.get(render_idx, meta["balls"])
-                homog_res = meta["homography"]
+                    players_stitched = stitched_by_frame.get(render_idx, [])
+                    balls_reconstructed = reconstructed_balls_by_frame.get(render_idx, meta["balls"])
+                    homog_res = meta["homography"]
 
-                annotated_cam = self.renderer.draw_camera_annotations(
-                    frame_bgr, players_stitched, balls_reconstructed, homog_res, stabilization_mode=stab_mode
-                )
-                plane_2d = self.renderer.render_2d_plane(
-                    players_stitched, balls_reconstructed, homog_res, update_trails=True
-                )
-                combined = self.renderer.compose_side_by_side(annotated_cam, plane_2d)
+                    annotated_cam = self.renderer.draw_camera_annotations(
+                        frame_bgr, players_stitched, balls_reconstructed, homog_res, stabilization_mode=stab_mode
+                    )
+                    plane_2d = self.renderer.render_2d_plane(
+                        players_stitched, balls_reconstructed, homog_res, update_trails=True
+                    )
+                    combined = self.renderer.compose_side_by_side(annotated_cam, plane_2d)
 
-                if writer is None:
-                    h_out, w_out = combined.shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w_out, h_out))
+                    if writer is None:
+                        h_out, w_out = combined.shape[:2]
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w_out, h_out))
 
-                writer.write(combined)
+                    writer.write(combined)
 
-                if render_idx % 20 == 0 or render_idx == frame_idx:
-                    pct = (render_idx / max(1, frame_idx)) * 100.0
-                    print(f"\r   [Render 2D] {render_idx}/{frame_idx} ({pct:5.1f}%)", end="", flush=True)
-        finally:
-            reader_render.release()
-            if writer is not None:
-                writer.release()
-            print()
+                    if render_idx % 20 == 0 or render_idx == frame_idx:
+                        pct = (render_idx / max(1, frame_idx)) * 100.0
+                        print(f"\r   [Render 2D] {render_idx}/{frame_idx} ({pct:5.1f}%)", end="", flush=True)
+            finally:
+                reader_render.release()
+                if writer is not None:
+                    writer.release()
+                print()
+            render_elapsed = time.time() - t_rend
 
         total_t = time.time() - t_pass1
+
+        # 2.4 Exportar Contratos JSON para `scoutingData_FrontEnd`
+        print("▶ Exportando contratos JSON (`match_metadata.json` y `tracking_output.json`)...")
+        model_player_cfg = str(self.config.get("models", {}).get("player", "models/modelPlayer.pt"))
+        model_fmt = Path(model_player_cfg).suffix.lstrip(".") or "pt"
+        dev_str = str(getattr(self.detector, "device", "cuda"))
+        json_exporter = ScoutingJsonExporter(config=self.config)
+
+        # Guardar tanto en subcarpeta `<out_dir>/<video_stem>/` como en `<out_dir>/`
+        json_subdir = out_path.parent / in_path.stem
+        exported_jsons = json_exporter.export_all(
+            video_path=in_path,
+            output_dir=json_subdir,
+            fps=fps,
+            total_frames=frame_idx,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            frame_cache_meta=frame_cache_meta,
+            stitched_by_frame=stitched_by_frame,
+            reconstructed_balls_by_frame=reconstructed_balls_by_frame,
+            team_bgr_palette=self.team_clusterer.team_bgr_palette,
+            stitch_stats=stitch_stats,
+            ball_stats=ball_stats,
+            homog_reconcile_stats=homog_reconcile_stats,
+            timings={
+                "total_s": total_t,
+                "pass1_s": pass1_elapsed,
+                "pass2_s": stitch_elapsed,
+                "render_s": render_elapsed,
+            },
+            device_str=dev_str,
+            model_format=model_fmt,
+            cuda_available=("cuda" in dev_str.lower()),
+        )
+
+        # Copiar también en el directorio raíz de salida (`outputs/match_metadata.json` y `outputs/tracking_output.json`)
+        import shutil
+        for k_name, src_json_path in exported_jsons.items():
+            dst_root_path = out_path.parent / src_json_path.name
+            if dst_root_path.resolve() != src_json_path.resolve():
+                shutil.copy2(src_json_path, dst_root_path)
+
         print("=" * 72)
-        print("✅ VIDEO Y COSIDO GLOBAL COMPLETADOS EXITOSAMENTE")
-        print(f"   Video Etiquetado:   {out_path}")
+        print("✅ VIDEO, COSIDO GLOBAL Y EXPORTACIÓN JSON COMPLETADOS EXITOSAMENTE")
+        if render_video:
+            print(f"   Video Etiquetado:   {out_path}")
+        print(f"   JSON Metadata:      {exported_jsons['match_metadata']}")
+        print(f"   JSON Inferencias:   {exported_jsons['tracking_output']}")
+        print(f"   JSON Identidades:   {exported_jsons['identity_manifest']}")
         print(f"   CSV Pasada 1 Crudo: {raw_csv_path}")
         print(f"   CSV Pasada 2 Cosido:{stitched_csv_path}")
         print(f"   CSV Traza Balón:    {ball_csv_path}")
@@ -458,6 +530,7 @@ class Soccer2DTrackingPipeline:
         input_path: Union[str, Path],
         output_path: Optional[Union[str, Path]] = None,
         max_frames: Optional[int] = None,
+        render_video: bool = True,
     ) -> Path:
         """Detecta automáticamente si la entrada es imagen o video y ejecuta el procesamiento."""
         in_path = Path(input_path)
@@ -465,7 +538,12 @@ class Soccer2DTrackingPipeline:
         if ext in IMAGE_EXTENSIONS:
             return self.process_image(in_path, output_path=output_path)
         if ext in VIDEO_EXTENSIONS:
-            return self.process_video(in_path, output_path=output_path, max_frames=max_frames)
+            return self.process_video(
+                in_path,
+                output_path=output_path,
+                max_frames=max_frames,
+                render_video=render_video,
+            )
         raise ValueError(
             f"Formato de archivo no soportado ({ext}). Use imagen {sorted(IMAGE_EXTENSIONS)} o video {sorted(VIDEO_EXTENSIONS)}."
         )
@@ -541,6 +619,12 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Ejecutar en 1 sola pasada sin el post-procesamiento tabular de la Pasada 2",
     )
+    parser.add_argument(
+        "--no-render-video",
+        action="store_true",
+        default=False,
+        help="Omitir el codificado del video MP4 y exportar únicamente los JSONs y CSVs sincerados",
+    )
     return parser.parse_args()
 
 
@@ -564,6 +648,7 @@ def main() -> None:
         input_path=input_source,
         output_path=args.output,
         max_frames=args.max_frames,
+        render_video=(not args.no_render_video),
     )
 
 

@@ -464,6 +464,250 @@ def test_voronoi_and_apollonius_geometry_player_and_ball():
     assert plane_img is not None and plane_img.shape[0] > 100
 
 
+def test_pass2_homography_reconciliation_and_scouting_json_exporter(tmp_path):
+    """
+    Verifica:
+    1. `reconcile_homographies_pass2`: Interpola H y H^-1 en un hueco corto (frame 2) entre
+       dos cuadros válidos (frames 1 y 3) sin corte de edición, y retro-proyecta jugadores/balón.
+    2. `ScoutingJsonExporter.export_all`: Genera `match_metadata.json`, `tracking_output.json`,
+       `identity_manifest.json` y `consolidation_report.json` cumpliendo 100% el contrato de
+       `scoutingData_FrontEnd`.
+    """
+    import json
+    from src.homography import HomographyFrameResult, KeypointObservation
+    from src.json_exporter import reconcile_homographies_pass2, ScoutingJsonExporter
+
+    H_valid = np.array([[0.05, 0.0, 5.0], [0.0, 0.05, 4.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    H_inv_valid = np.linalg.inv(H_valid)
+
+    kp_sample = [
+        KeypointObservation(
+            kp_index=12,
+            kp_id="15",
+            raw_px=(950.0, 100.0),
+            stabilized_px=(950.0, 100.0),
+            pitch_m=(52.5, 0.0),
+            confidence=0.95,
+            is_inlier=True,
+        )
+    ]
+
+    frame_cache_meta = {
+        1: {
+            "balls": [],
+            "homography": HomographyFrameResult(
+                H=H_valid.copy(),
+                H_inv=H_inv_valid.copy(),
+                is_valid=True,
+                is_closeup_or_cut=False,
+                status_message="OK",
+                green_ratio=0.65,
+                keypoints=kp_sample,
+            ),
+        },
+        2: {
+            "balls": [],
+            # Frame 2 tuvo pérdida momentánea de keypoints en el mismo plano abierto (sin corte)
+            "homography": HomographyFrameResult(
+                H=None,
+                H_inv=None,
+                is_valid=False,
+                is_closeup_or_cut=False,
+                status_message="Pocos keypoints",
+                shot_cut_histogram=False,
+                proximity_switch_triggered=False,
+                green_ratio=0.62,
+                keypoints=[],
+            ),
+        },
+        3: {
+            "balls": [],
+            "homography": HomographyFrameResult(
+                H=H_valid.copy(),
+                H_inv=H_inv_valid.copy(),
+                is_valid=True,
+                is_closeup_or_cut=False,
+                status_message="OK",
+                green_ratio=0.66,
+                keypoints=kp_sample,
+            ),
+        },
+    }
+
+    raw_players = [
+        {"frame": 2, "foot_px_x": 800.0, "foot_px_y": 500.0, "pitch_x_m": None, "pitch_y_m": None}
+    ]
+    raw_balls = [
+        {"frame": 2, "center_px_x": 820.0, "center_px_y": 510.0, "pitch_x_m": None, "pitch_y_m": None}
+    ]
+
+    reconcile_stats = reconcile_homographies_pass2(
+        frame_cache_meta=frame_cache_meta,
+        raw_player_records=raw_players,
+        raw_ball_records=raw_balls,
+        max_gap_frames=10,
+    )
+
+    assert reconcile_stats["interpolated_pass2"] == 1
+    assert frame_cache_meta[2]["homography"].is_valid is True
+    assert frame_cache_meta[2]["homography"].H is not None
+    assert raw_players[0]["pitch_x_m"] is not None
+    assert raw_balls[0]["pitch_x_m"] is not None
+
+    stitched_by_frame = {
+        1: [
+            {
+                "id": 1,
+                "raw_track_id": 10,
+                "role": "Player",
+                "conf": 0.91,
+                "bbox": [780.0, 420.0, 820.0, 500.0],
+                "foot_px": (800.0, 500.0),
+                "pitch_m": (45.0, 29.0),
+                "speed_mps": 5.4,
+                "vx_mps": 5.0,
+                "vy_mps": 2.0,
+                "team_id": 1,
+                "jersey_number": "10",
+                "is_interpolated": False,
+            },
+            {
+                "id": 2,
+                "raw_track_id": 22,
+                "role": "Referee",
+                "conf": 0.85,
+                "bbox": [600.0, 400.0, 635.0, 480.0],
+                "foot_px": (617.5, 480.0),
+                "pitch_m": (35.8, 28.0),
+                "speed_mps": 2.1,
+                "vx_mps": 1.0,
+                "vy_mps": 0.5,
+                "team_id": 4,
+                "jersey_number": None,
+                "is_interpolated": False,
+            },
+        ],
+        2: [
+            {
+                "id": 1,
+                "raw_track_id": 10,
+                "role": "Player",
+                "conf": 0.90,
+                "bbox": [785.0, 422.0, 825.0, 502.0],
+                "foot_px": (805.0, 502.0),
+                "pitch_m": (45.25, 29.1),
+                "speed_mps": 5.4,
+                "vx_mps": 5.0,
+                "vy_mps": 2.0,
+                "team_id": 1,
+                "jersey_number": "10",
+                "is_interpolated": True,
+            }
+        ],
+        3: [],
+    }
+
+    reconstructed_balls_by_frame = {
+        1: [
+            {
+                "id": 1,
+                "conf": 0.80,
+                "bbox": [802.0, 494.0, 816.0, 508.0],
+                "center_px": (809.0, 501.0),
+                "pitch_m": (45.45, 29.05),
+                "speed_mps": 8.2,
+                "state": "LOCKED",
+                "carrier_id": 10,
+                "is_interpolated": False,
+            }
+        ],
+        2: [
+            {
+                "id": 1,
+                "conf": 0.72,
+                "bbox": [808.0, 496.0, 822.0, 510.0],
+                "center_px": (815.0, 503.0),
+                "pitch_m": (45.75, 29.15),
+                "speed_mps": 8.0,
+                "state": "RECONSTRUCTED_APOLLONIUS_TOUCH",
+                "carrier_id": 10,
+                "is_interpolated": True,
+            }
+        ],
+    }
+
+    exporter = ScoutingJsonExporter()
+    paths = exporter.export_all(
+        video_path="test_match.mp4",
+        output_dir=tmp_path,
+        fps=25.0,
+        total_frames=3,
+        frame_width=1920,
+        frame_height=1080,
+        frame_cache_meta=frame_cache_meta,
+        stitched_by_frame=stitched_by_frame,
+        reconstructed_balls_by_frame=reconstructed_balls_by_frame,
+        team_bgr_palette={1: (255, 190, 0), 2: (50, 60, 245), 4: (0, 215, 255)},
+        stitch_stats={
+            "raw_tracklets": 2,
+            "stitched_players": 2,
+            "merges_performed": 0,
+            "identities_manifest": [
+                {
+                    "identity_id": "ID_0001",
+                    "global_track_id": 1,
+                    "status": "CONFIRMED",
+                    "creation_method": "AUTOMATIC",
+                    "confidence_score": 0.91,
+                    "track_ids": [1, 10],
+                    "segment_count": 1,
+                    "frame_span": {"first_frame": 1, "last_frame": 2, "total_active_frames": 2},
+                    "kinematics": {"avg_velocity_ms": 5.4},
+                    "links": [],
+                }
+            ],
+        },
+        ball_stats={"active_ball_frames": 2, "interpolated_frames": 1},
+        homog_reconcile_stats=reconcile_stats,
+        timings={"total_s": 1.5, "pass1_s": 1.0, "pass2_s": 0.2, "render_s": 0.3},
+    )
+
+    assert paths["match_metadata"].exists()
+    assert paths["tracking_output"].exists()
+    assert paths["identity_manifest"].exists()
+    assert paths["consolidation_report"].exists()
+
+    meta_data = json.loads(paths["match_metadata"].read_text(encoding="utf-8"))
+    track_data = json.loads(paths["tracking_output"].read_text(encoding="utf-8"))
+
+    # Validar contrato esperado por scoutingData_FrontEnd
+    assert meta_data["teams"]["team_a"]["id"] == 0
+    assert meta_data["teams"]["team_b"]["id"] == 1
+    assert meta_data["teams"]["referee"]["id"] == -1
+    assert meta_data["teams"]["team_a"]["color_hex"].startswith("#")
+    assert len(track_data["frames"]) == 3
+
+    f1 = track_data["frames"][0]
+    assert f1["frame"] == 1
+    assert f1["homography"]["valid"] is True
+    assert len(f1["homography"]["matrix"]) == 3
+    assert len(f1["homography"]["inv_matrix"]) == 3
+    assert f1["players"][0]["track_id"] == 1
+    assert f1["players"][0]["team_id"] == 0
+    assert f1["players"][0]["shirt_number"] == "10"
+    assert f1["players"][1]["team_id"] == -1
+    assert f1["players"][1]["role"] == "referee"
+    assert f1["ball"]["carrier_track_id"] == 1
+    assert f1["possession"]["possessor_id"] == 1
+    assert f1["possession"]["team_id"] == 0
+
+    f2 = track_data["frames"][1]
+    assert f2["homography"]["valid"] is True
+    assert f2["homography"]["is_interpolated"] is True
+    assert f2["ball"]["state"] == "RECONSTRUCTED_APOLLONIUS_TOUCH"
+
+
+
 
 
 
