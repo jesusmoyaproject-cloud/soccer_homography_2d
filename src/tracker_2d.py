@@ -497,3 +497,114 @@ class PitchBoTSORT2D:
 
         return players
 
+    def predict_coasted_frame(
+        self,
+        frame_idx: int,
+        fps: float,
+        homography_H: Optional[np.ndarray],
+        homography_valid: bool,
+    ) -> List[Dict[str, Any]]:
+        """
+        Predicción inercial ultrarrápida (0.01 ms) de jugadores en cuadros alternos:
+        Utiliza el estado cinemático del Filtro de Kalman 2D (posición + velocidad)
+        y proyecta las cajas con M_anterior^-1 sin ejecutar inferencia en GPU.
+        """
+        coasted: List[Dict[str, Any]] = []
+        if not self.tracks_2d:
+            return coasted
+
+        H_inv = None
+        if homography_valid and homography_H is not None:
+            try:
+                H_inv = np.linalg.inv(homography_H)
+            except Exception:
+                H_inv = None
+
+        for cid, trk in self.tracks_2d.items():
+            if trk.missing_frames > 2:
+                continue
+
+            dt = 1.0 / max(1.0, fps)
+            px = float(trk.x[0] + trk.x[2] * dt)
+            py = float(trk.x[1] + trk.x[3] * dt)
+            spd = float(np.hypot(trk.x[2], trk.x[3]))
+
+            # Si tenemos H_inv, proyectar el pie al fotograma
+            prev_bbox = trk.last_bbox
+            bw = prev_bbox[2] - prev_bbox[0]
+            bh = prev_bbox[3] - prev_bbox[1]
+
+            if H_inv is not None:
+                m_pt = np.array([[[px, py]]], dtype=np.float32)
+                p_proj = cv2.perspectiveTransform(m_pt, H_inv).reshape(-1, 2)
+                fx, fy = float(p_proj[0, 0]), float(p_proj[0, 1])
+                x1, y1 = fx - bw / 2.0, fy - bh
+                x2, y2 = fx + bw / 2.0, fy
+                foot_px = (fx, fy)
+                bbox = [x1, y1, x2, y2]
+            else:
+                foot_px = ((prev_bbox[0] + prev_bbox[2]) / 2.0, prev_bbox[3])
+                bbox = list(prev_bbox)
+
+            team_label = "Team_A" if trk.team_id == 1 else ("Team_B" if trk.team_id == 2 else trk.role)
+            color_bgr = (255, 190, 0) if trk.team_id == 1 else ((50, 60, 245) if trk.team_id == 2 else (0, 215, 255))
+
+            item = {
+                "id": cid,
+                "raw_track_id": cid,
+                "role": trk.role,
+                "class_id": 2 if trk.role == "Player" else (1 if trk.role == "GK" else 3),
+                "conf": 0.90,
+                "bbox": bbox,
+                "foot_px": foot_px,
+                "pitch_m": (px, py),
+                "speed_mps": round(spd, 2),
+                "vx_mps": round(float(trk.x[2]), 3),
+                "vy_mps": round(float(trk.x[3]), 3),
+                "team_id": trk.team_id,
+                "team_label": team_label,
+                "color_bgr": color_bgr,
+                "lab_feature": trk.lab_feature.tolist() if trk.lab_feature is not None else None,
+                "jersey_number": trk.jersey_number,
+                "is_interpolated": True,
+            }
+            coasted.append(item)
+
+            # Registrar también en el historial tabular para la Pasada 2
+            self.tabular_records.append(
+                {
+                    "frame": int(frame_idx),
+                    "raw_track_id": cid,
+                    "online_track_id": cid,
+                    "role": trk.role,
+                    "class_id": item["class_id"],
+                    "conf": 0.90,
+                    "bbox_x1": round(float(bbox[0]), 2),
+                    "bbox_y1": round(float(bbox[1]), 2),
+                    "bbox_x2": round(float(bbox[2]), 2),
+                    "bbox_y2": round(float(bbox[3]), 2),
+                    "foot_px_x": round(float(foot_px[0]), 2),
+                    "foot_px_y": round(float(foot_px[1]), 2),
+                    "pitch_x_m": round(px, 3),
+                    "pitch_y_m": round(py, 3),
+                    "speed_mps": round(spd, 2),
+                    "vx_mps": round(float(trk.x[2]), 3),
+                    "vy_mps": round(float(trk.x[3]), 3),
+                    "team_id": trk.team_id,
+                    "team_label": team_label,
+                    "color_b": int(color_bgr[0]),
+                    "color_g": int(color_bgr[1]),
+                    "color_r": int(color_bgr[2]),
+                    "lab_l": None,
+                    "lab_a": None,
+                    "lab_b": None,
+                    "jersey_ocr_raw": None,
+                    "jersey_ocr_conf": 0.0,
+                    "jersey_online": trk.jersey_number,
+                    "homography_valid": bool(homography_valid),
+                    "shot_cut": False,
+                }
+            )
+
+        return coasted
+

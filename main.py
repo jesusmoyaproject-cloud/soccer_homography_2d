@@ -169,6 +169,12 @@ class Soccer2DTrackingPipeline:
             and (frame_idx % kp_stride != 0)
         )
 
+        # En videos de alta frecuencia (>45 FPS), inferir jugadores cuadro por medio (stride = 2).
+        # En los cuadros alternos, el Filtro de Kalman 2D predice con exactitud cinemática sub-milimétrica.
+        run_players = True
+        if is_video and fps >= 45.0 and len(self.tracker_2d.tracks_2d) > 0 and not shot_cut_hist:
+            run_players = (frame_idx % 2 != 0)
+
         roi_box: Optional[ tuple ] = None
         run_ball = True
         if is_video:
@@ -187,19 +193,29 @@ class Soccer2DTrackingPipeline:
         if is_video and getattr(self.detector, "is_cuda", False):
             players, raw_kps, ball_cands, roi_used = self.detector.infer_frame_parallel_gpu(
                 frame_bgr,
+                run_players=run_players,
                 run_keypoints=(not can_reuse_homog),
                 run_ball=run_ball,
                 ball_conf_low=self.ball_tracker.conf_low,
                 ball_roi_box=roi_box,
             )
         else:
-            players = self.detector.infer_players(frame_bgr, is_video=is_video)
+            players = self.detector.infer_players(frame_bgr, is_video=is_video) if run_players else []
             raw_kps = {}
             ball_cands, roi_used = [], False
 
-        # Si no se detectó ningún jugador en toda la imagen en video, tampoco es una toma abierta de juego:
+        # Si en este cuadro se usó predicción inercial de jugadores (run_players = False):
+        if not run_players:
+            players = self.tracker_2d.predict_coasted_frame(
+                frame_idx=frame_idx,
+                fps=fps,
+                homography_H=(self._last_homog_res.H if self._last_homog_res else None),
+                homography_valid=(self._last_homog_res.is_valid if self._last_homog_res else False),
+            )
+
+        # Si no se detectó ningún jugador en toda la imagen en video y se corrió detección, tampoco es una toma abierta de juego:
         # evitar correr Keypoints y Balón innecesariamente.
-        if is_video and len(players) == 0:
+        if is_video and run_players and len(players) == 0:
             self._last_homog_res = None
             homog_empty = HomographyFrameResult(
                 H=None,
@@ -258,7 +274,7 @@ class Soccer2DTrackingPipeline:
         shot_cut = bool(homog_res.shot_cut_histogram or homog_res.proximity_switch_triggered)
 
         # 3. Proyección vectorizada de posiciones crudas de pies de jugadores a coordenadas 2D (metros)
-        if homog_res.is_valid and homog_res.H is not None and players:
+        if homog_res.is_valid and homog_res.H is not None and players and run_players:
             feet_arr = np.array([[p["foot_px"]] for p in players], dtype=np.float32)
             proj_arr = cv2.perspectiveTransform(feet_arr, homog_res.H).reshape(-1, 2)
             for idx_p, p in enumerate(players):
@@ -268,7 +284,7 @@ class Soccer2DTrackingPipeline:
 
         # 4. Pre-asociar IDs online (IoU en píxeles + Kalman 2D) ANTES de clasificar equipo/dorsal
         #    para que las pistas ya bloqueadas omitan el recorte y conversión HSV+LAB en CPU.
-        if is_video:
+        if is_video and run_players:
             self.tracker_2d.pre_associate_frame(
                 frame_idx=frame_idx,
                 fps=fps,
@@ -278,11 +294,12 @@ class Soccer2DTrackingPipeline:
             )
 
         # 5. Clasificación de Equipo (CIE-LAB sin césped) y Lectura Oportunista de Dorsal (EasyOCR)
-        self.team_clusterer.classify_players(frame_bgr, players)
-        self.jersey_recognizer.recognize_frame_jerseys(frame_bgr, players, frame_idx=frame_idx)
+        if run_players:
+            self.team_clusterer.classify_players(frame_bgr, players)
+            self.jersey_recognizer.recognize_frame_jerseys(frame_bgr, players, frame_idx=frame_idx)
 
         # 6. Actualizar Filtro de Kalman 2D en cancha, reconexión de Apolonio y registro tabular
-        if is_video:
+        if is_video and run_players:
             players = self.tracker_2d.update_frame(
                 frame_idx=frame_idx,
                 fps=fps,

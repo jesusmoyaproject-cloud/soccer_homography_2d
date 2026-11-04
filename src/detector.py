@@ -247,6 +247,7 @@ class SoccerInferenceEngine:
     def infer_frame_parallel_gpu(
         self,
         frame_bgr: np.ndarray,
+        run_players: bool = True,
         run_keypoints: bool = True,
         run_ball: bool = True,
         ball_conf_low: float = 0.15,
@@ -255,14 +256,13 @@ class SoccerInferenceEngine:
         """
         Super-pipeline de inferencia en GPU (NVIDIA L4):
         1. Sube `frame_bgr` por PCIe a VRAM una sola vez por fotograma.
-        2. Calcula el tensor `LetterBox` 640x640 en GPU una sola vez y lo comparte entre
-           `player_model`, `keypoint_model` y `ball_model` (o recorta el ROI de balón directo en VRAM).
-        3. Ejecuta los 3 motores TensorRT/PyTorch en paralelo sobre 3 `torch.cuda.Stream` concurrentes.
+        2. Calcula el tensor `LetterBox` en GPU una sola vez y lo comparte entre motores.
+        3. Ejecuta solo los modelos necesarios de forma asíncrona.
         Retorna: (players, raw_kps, ball_cands, roi_used)
         """
         if not self.is_cuda or self._gpu_pool is None:
-            players = self.infer_players(frame_bgr, is_video=True)
-            if not players:
+            players = self.infer_players(frame_bgr, is_video=True) if run_players else []
+            if not players and run_players:
                 return [], {}, [], False
             raw_kps = (
                 self.infer_keypoints(frame_bgr, exclude_player_boxes=[p["bbox"] for p in players])
@@ -337,11 +337,11 @@ class SoccerInferenceEngine:
                     verbose=False,
                 )[0]
 
-        fut_p = self._gpu_pool.submit(_task_players)
+        fut_p = self._gpu_pool.submit(_task_players) if run_players else None
         fut_kp = self._gpu_pool.submit(_task_keypoints) if run_keypoints else None
         fut_b = self._gpu_pool.submit(_task_ball) if run_ball else None
 
-        res_p = fut_p.result()
+        res_p = fut_p.result() if fut_p is not None else None
         res_kp = fut_kp.result() if fut_kp is not None else None
         res_b = fut_b.result() if fut_b is not None else None
 
@@ -350,7 +350,7 @@ class SoccerInferenceEngine:
 
         # 1. Decodificar jugadores (deshaciendo LetterBox a coordenadas originales w_orig x h_orig)
         players: List[Dict[str, Any]] = []
-        if res_p.boxes is not None and len(res_p.boxes) > 0:
+        if res_p is not None and res_p.boxes is not None and len(res_p.boxes) > 0:
             boxes_net = res_p.boxes.xyxy.cpu().numpy()
             confs = res_p.boxes.conf.cpu().numpy()
             classes = res_p.boxes.cls.cpu().numpy().astype(int)
