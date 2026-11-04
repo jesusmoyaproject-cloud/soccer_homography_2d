@@ -5,6 +5,7 @@ Gating por Equipo (CIE-LAB) y reconexión inmediata de pistas en coordenadas de 
 """
 
 from typing import Dict, List, Tuple, Optional, Any
+import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from src.spatial_geometry import apollonius_reach_cost
