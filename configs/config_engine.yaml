@@ -13,6 +13,7 @@ models:
 
 # Umbrales de confianza solicitados
 detection:
+  imgsz: 1280             # Tamaño de entrada para modelos TensorRT compilados en 1280x1280
   conf_player: 0.50       # Confianza requerida para jugador: 0.5
   conf_ball: 0.40         # Confianza requerida para balón: 0.4
   conf_keypoint: 0.35     # Confianza mínima para los 30 keypoints de cancha

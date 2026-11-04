@@ -58,6 +58,7 @@ class Soccer2DTrackingPipeline:
         conf_player_override: Optional[float] = None,
         conf_ball_override: Optional[float] = None,
         two_pass_override: Optional[bool] = None,
+        imgsz_override: Optional[int] = None,
     ):
         self.config = load_yaml_config(config_path)
 
@@ -69,6 +70,8 @@ class Soccer2DTrackingPipeline:
             self.config.setdefault("detection", {})["conf_ball"] = float(conf_ball_override)
         if two_pass_override is not None:
             self.config.setdefault("tracking_2d", {})["enable_two_pass"] = bool(two_pass_override)
+        if imgsz_override is not None:
+            self.config.setdefault("detection", {})["imgsz"] = int(imgsz_override)
 
         self.enable_two_pass = bool(
             self.config.get("tracking_2d", {}).get("enable_two_pass", True)
@@ -759,6 +762,12 @@ def parse_args() -> argparse.Namespace:
         help="Umbral de confianza para balón (por defecto: 0.4 en YAML)",
     )
     parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=None,
+        help="Tamaño de entrada para inferencia en píxeles (por defecto: 1280 en YAML o auto-detectado del modelo)",
+    )
+    parser.add_argument(
         "--max-frames", "-m",
         type=int,
         default=None,
@@ -794,6 +803,7 @@ def main() -> None:
         conf_player_override=args.conf_player,
         conf_ball_override=args.conf_ball,
         two_pass_override=(False if args.single_pass else None),
+        imgsz_override=args.imgsz,
     )
     pipeline.process(
         input_path=input_source,

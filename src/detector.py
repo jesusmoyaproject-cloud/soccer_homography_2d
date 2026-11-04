@@ -107,7 +107,6 @@ class SoccerInferenceEngine:
         self.conf_player = float(det_cfg.get("conf_player", 0.50))
         self.conf_ball = float(det_cfg.get("conf_ball", 0.40))
         self.conf_keypoint = float(det_cfg.get("conf_keypoint", 0.35))
-        self.imgsz = int(det_cfg.get("imgsz", 640))
         self.player_classes = det_cfg.get("player_classes", [1, 2, 3])
         self.class_names = det_cfg.get("class_names", {0: "Ball", 1: "GK", 2: "Player", 3: "Referee"})
         tracker_rel = det_cfg.get("tracker_config", "configs/botsort_sports.yaml")
@@ -118,6 +117,31 @@ class SoccerInferenceEngine:
         self.player_model = self._load_model(self.player_model_path, task="detect")
         self.ball_model = self._load_model(self.ball_model_path, task="detect")
         self.keypoint_model = self._load_model(self.kp_model_path, task="pose")
+
+        # Resolución de tamaño de entrada (imgsz):
+        # 1. Configuración explícita en detection.imgsz
+        # 2. Inferencia automática desde los metadatos del modelo cargado (.pt o .engine)
+        # 3. Fallback a 1280 (resolución nativa de entrenamiento de los modelos)
+        configured_imgsz = det_cfg.get("imgsz")
+        if configured_imgsz is not None:
+            self.imgsz = int(configured_imgsz)
+        else:
+            inferred_sz = None
+            for m in (self.player_model, self.keypoint_model, self.ball_model):
+                sz = getattr(m, "overrides", {}).get("imgsz", None)
+                if sz is None and hasattr(m, "model"):
+                    sz = getattr(m.model, "args", {}).get("imgsz", None)
+                    if sz is None:
+                        sz = getattr(m.model, "imgsz", None)
+                if sz is not None:
+                    inferred_sz = sz[0] if isinstance(sz, (list, tuple)) else sz
+                    break
+            self.imgsz = int(inferred_sz) if inferred_sz else 1280
+
+        # Garantizar que todos los modelos Ultralytics usen self.imgsz tanto en predict como en su predictor interno
+        for m in (self.player_model, self.keypoint_model, self.ball_model):
+            if hasattr(m, "overrides"):
+                m.overrides["imgsz"] = self.imgsz
 
         # Inicializar CUDA Streams paralelos y pre-calentar motores TensorRT/CUDA en VRAM
         self.is_cuda = ("cuda" in self.device) and torch.cuda.is_available()
@@ -136,7 +160,8 @@ class SoccerInferenceEngine:
     def _warmup_models(self) -> None:
         """
         Pre-calienta (Warmup) los 3 modelos en GPU durante la inicialización para que
-        los contextos de ejecución de TensorRT (.engine) se alojen en VRAM antes del Frame 1.
+        los contextos de ejecución de TensorRT (.engine) se alojen en VRAM antes del Frame 1
+        y queden calibrados con self.imgsz (evitando el fallback a 640x640 en predictor.warmup).
         """
         try:
             dummy = torch.zeros((1, 3, self.imgsz, self.imgsz), device=self.device, dtype=torch.float32)
@@ -153,7 +178,8 @@ class SoccerInferenceEngine:
                 device=self.device, half=self.half, verbose=False
             )
             torch.cuda.synchronize()
-        except Exception:
+        except Exception as e:
+            # Si un backend TensorRT estático ya fue precalentado o lanza aviso inocuo
             pass
 
     @staticmethod
