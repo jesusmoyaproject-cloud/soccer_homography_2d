@@ -155,8 +155,10 @@ class Soccer2DTrackingPipeline:
                 return {"players": [], "balls": [], "homography": homog_closeup}
 
         # 1. Determinar de antemano si en este cuadro corremos Keypoints y/o Balón
-        #    para despachar los 3 motores en paralelo sobre 3 CUDA Streams (1 sola subida PCIe + LetterBox en GPU).
-        kp_stride = 3 if fps >= 45.0 else 2
+        #    para despachar los motores (1 sola subida PCIe + LetterBox en GPU).
+        #    Stride adaptativo: mientras la homografía tenga >= 6 inliers estables sin corte de cámara,
+        #    se reutiliza H durante 3 cuadros (ejecuta KPs cada 4 cuadros), reduciendo el cómputo de GPU.
+        kp_stride = 4 if fps >= 20.0 else 2
         can_reuse_homog = (
             is_video
             and not shot_cut_hist
@@ -174,10 +176,10 @@ class Soccer2DTrackingPipeline:
                 self.ball_tracker.missing_frames >= 3 and self.ball_tracker.missing_frames % 3 == 0
             )
             roi_box = None if force_full_scan else self.ball_tracker.get_dynamic_roi(w_img, h_img)
+            # En estado LOST, escanear Full-Frame alternando cuadros (cada 2 frames) para ahorrar GPU
             skip_lost_full_scan = (
                 roi_box is None
                 and self.ball_tracker.state.value == "LOST"
-                and fps >= 45.0
                 and (frame_idx % 2 == 0)
             )
             run_ball = not skip_lost_full_scan

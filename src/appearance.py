@@ -147,13 +147,21 @@ class TeamClusterer:
             tid = int(p["id"])
             # Si el jugador ya tiene su equipo bloqueado y el K-Means ya está calibrado,
             # reutilizar directamente sin volver a recortar ni convertir HSV/LAB en CPU.
-            if tid in self._locked_team and self.centroids_lab is not None and len(self._buffer_lab) >= 40:
+            if tid in self._locked_team and self.centroids_lab is not None and len(self._buffer_lab) >= 16:
                 team_id = self._locked_team[tid]
                 p["team_id"] = team_id
                 p["team_label"] = "Team_A" if team_id == 1 else "Team_B"
                 p["color_bgr"] = self.team_bgr_palette.get(team_id, (255, 190, 0))
                 cached_labs = self._track_lab_sum.get(tid)
                 p["lab_feature"] = cached_labs[-1].tolist() if cached_labs else None
+                continue
+
+            # Presupuesto de CPU: limitar las extracciones pesadas de color a un máximo por cuadro
+            if len(frame_features) >= 4 and self.centroids_lab is not None:
+                p["team_id"] = self._locked_team.get(tid, 1)
+                p["team_label"] = "Team_A" if p["team_id"] == 1 else "Team_B"
+                p["color_bgr"] = self.team_bgr_palette.get(p["team_id"], (255, 190, 0))
+                p["lab_feature"] = None
                 continue
 
             res = _extract_non_grass_torso_lab(frame_bgr, p["bbox"])

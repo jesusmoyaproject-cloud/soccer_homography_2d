@@ -89,8 +89,8 @@ tracking_2d:
   memory_frames: 45              # Cuadros de memoria en el filtro de Kalman 2D
 
   team_filter:
-    min_samples_to_fit: 12       # Muestras mínimas para calibrar los 2 clusters CIE-LAB de equipo
-    lock_votes: 8                # Votos necesarios para bloquear el equipo de un track_id
+    min_samples_to_fit: 8        # Muestras mínimas para calibrar los 2 clusters CIE-LAB de equipo (calibración rápida)
+    lock_votes: 3                # Votos necesarios para bloquear el equipo de un track_id (rápido bloqueo de CPU)
 
   jersey_ocr:
     enabled: false               # Desactivado por defecto para maximizar FPS (activar con true si se requieren dorsales)
