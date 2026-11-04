@@ -156,7 +156,7 @@ class Soccer2DTrackingPipeline:
 
         # 1. Determinar de antemano si en este cuadro corremos Keypoints y/o Balón
         #    para despachar los motores (1 sola subida PCIe + LetterBox en GPU).
-        #    Stride adaptativo: mientras la homografía tenga >= 6 inliers estables sin corte de cámara,
+        #    Stride adaptativo: mientras la homografía tenga >= 4 inliers estables sin corte de cámara,
         #    se reutiliza H durante 3 cuadros (ejecuta KPs cada 4 cuadros), reduciendo el cómputo de GPU.
         kp_stride = 4 if fps >= 20.0 else 2
         can_reuse_homog = (
@@ -165,7 +165,7 @@ class Soccer2DTrackingPipeline:
             and self._last_homog_res is not None
             and self._last_homog_res.is_valid
             and self._last_homog_res.H is not None
-            and self._last_homog_res.num_inliers >= 6
+            and self._last_homog_res.num_inliers >= 4
             and (frame_idx % kp_stride != 0)
         )
 

@@ -296,14 +296,14 @@ class SoccerInferenceEngine:
                 )
                 roi_used = True
 
-        # Sincronizar el stream por defecto antes de abrir las 3 ramas paralelas
+        # Sincronizar el stream por defecto antes de abrir las ramas de inferencia
         prep_event = torch.cuda.Event()
         prep_event.record()
 
         def _task_players():
             with torch.cuda.stream(self.stream_player):
                 self.stream_player.wait_event(prep_event)
-                res = self.player_model.predict(
+                return self.player_model.predict(
                     source=full_padded,
                     imgsz=self.imgsz,
                     conf=self.conf_player,
@@ -312,13 +312,11 @@ class SoccerInferenceEngine:
                     half=self.half,
                     verbose=False,
                 )[0]
-                self.stream_player.synchronize()
-                return res
 
         def _task_keypoints():
             with torch.cuda.stream(self.stream_kp):
                 self.stream_kp.wait_event(prep_event)
-                res = self.keypoint_model.predict(
+                return self.keypoint_model.predict(
                     source=full_padded,
                     imgsz=self.imgsz,
                     conf=self.conf_keypoint,
@@ -326,13 +324,11 @@ class SoccerInferenceEngine:
                     half=self.half,
                     verbose=False,
                 )[0]
-                self.stream_kp.synchronize()
-                return res
 
         def _task_ball():
             with torch.cuda.stream(self.stream_ball):
                 self.stream_ball.wait_event(prep_event)
-                res = self.ball_model.predict(
+                return self.ball_model.predict(
                     source=ball_input_tensor,
                     imgsz=self.imgsz,
                     conf=float(ball_conf_low),
@@ -340,8 +336,6 @@ class SoccerInferenceEngine:
                     half=self.half,
                     verbose=False,
                 )[0]
-                self.stream_ball.synchronize()
-                return res
 
         fut_p = self._gpu_pool.submit(_task_players)
         fut_kp = self._gpu_pool.submit(_task_keypoints) if run_keypoints else None
@@ -350,6 +344,9 @@ class SoccerInferenceEngine:
         res_p = fut_p.result()
         res_kp = fut_kp.result() if fut_kp is not None else None
         res_b = fut_b.result() if fut_b is not None else None
+
+        # Sincronización única consolidada de GPU tras completar las tareas
+        torch.cuda.synchronize()
 
         # 1. Decodificar jugadores (deshaciendo LetterBox a coordenadas originales w_orig x h_orig)
         players: List[Dict[str, Any]] = []
