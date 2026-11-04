@@ -233,7 +233,7 @@ class Soccer2DTrackingPipeline:
                 H_inv=prev_h.H_inv,
                 is_valid=True,
                 is_closeup_or_cut=False,
-                status_message=prev_h.status_message,
+                status_message=f"REUTILIZADA ({prev_h.num_inliers} inliers)",
                 shot_cut_histogram=False,
                 proximity_switch_triggered=False,
                 histogram_diff=pre_hist[1] if pre_hist else 0.0,
@@ -245,6 +245,7 @@ class Soccer2DTrackingPipeline:
                 mean_reproj_error_px=prev_h.mean_reproj_error_px,
                 keypoints=prev_h.keypoints,
             )
+            self._last_homog_res = homog_res
         else:
             if not (is_video and getattr(self.detector, "is_cuda", False)):
                 player_boxes = [p["bbox"] for p in players]
@@ -472,9 +473,11 @@ class Soccer2DTrackingPipeline:
                     elapsed = max(1e-6, time.time() - t_pass1)
                     curr_fps = frame_idx / elapsed
                     pct = (frame_idx / max(1, target_frames)) * 100.0
+                    stat_msg = step['homography'].status_message
+                    kps_info = "REUTIL" if "REUTILIZADA" in stat_msg else "CALC"
                     print(
                         f"\r   [Pasada 1] {frame_idx}/{target_frames} ({pct:5.1f}%) | "
-                        f"{curr_fps:4.1f} FPS | {step['homography'].status_message[:40]}",
+                        f"{curr_fps:4.1f} FPS | Homog: {kps_info} ({stat_msg[:32]})",
                         end="",
                         flush=True,
                     )
