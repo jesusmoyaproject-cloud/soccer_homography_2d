@@ -32,17 +32,21 @@ class ThreadedVideoReader:
         video_path: Union[str, Path],
         queue_size: int = 256,
         max_frames: Optional[int] = None,
+        stride: int = 1,
     ):
         self.video_path = str(video_path)
         self.queue_size = int(queue_size)
         self.max_frames = max_frames
+        self.stride = max(1, int(stride))
 
         self.cap = cv2.VideoCapture(self.video_path)
         if not self.cap.isOpened():
             raise RuntimeError(f"No se pudo abrir el video con OpenCV: {self.video_path}")
 
-        self.fps = float(self.cap.get(cv2.CAP_PROP_FPS)) or 25.0
-        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        raw_fps = float(self.cap.get(cv2.CAP_PROP_FPS)) or 25.0
+        self.fps = raw_fps / float(self.stride)
+        raw_total = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.total_frames = (raw_total + self.stride - 1) // self.stride if raw_total > 0 else 0
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -58,19 +62,24 @@ class ThreadedVideoReader:
         self.thread.start()
 
     def _worker(self) -> None:
-        frame_idx = 0
+        raw_idx = 0
+        dispatched_idx = 0
         while not self.stopped:
-            if self.max_frames and frame_idx >= self.max_frames:
+            if self.max_frames and dispatched_idx >= self.max_frames:
                 break
 
             ret, frame = self.cap.read()
             if not ret or frame is None:
                 break
 
-            frame_idx += 1
+            raw_idx += 1
+            if self.stride > 1 and (raw_idx - 1) % self.stride != 0:
+                continue
+
+            dispatched_idx += 1
             while not self.stopped:
                 try:
-                    self.queue.put((frame_idx, frame), timeout=0.1)
+                    self.queue.put((dispatched_idx, frame), timeout=0.1)
                     break
                 except Exception:
                     continue

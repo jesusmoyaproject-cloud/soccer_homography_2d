@@ -416,9 +416,10 @@ class Soccer2DTrackingPipeline:
         output_path: Optional[Union[str, Path]] = None,
         max_frames: Optional[int] = None,
         render_video: bool = True,
+        stride: int = 1,
     ) -> Path:
         """
-        Procesa un archivo de video (restringido por defecto a 3000 frames) ejecutando:
+        Procesa un archivo de video ejecutando:
           - Pasada 1: Inferencia frame a frame + Homografía MAGSAC++ + Kalman 2D + Equipo + OCR.
           - Pasada 2: Sinceramiento Homográfico + Global Tracklet Stitching + Reconstrucción Balón
                       + Exportación JSON (`match_metadata.json`, `tracking_output.json`) + Renderizado.
@@ -426,6 +427,8 @@ class Soccer2DTrackingPipeline:
         in_path = Path(video_path)
         if not in_path.exists():
             raise FileNotFoundError(f"Video no encontrado: {in_path}")
+
+        stride = max(1, int(stride or self.config.get("video", {}).get("stride", 1)))
 
         cap = cv2.VideoCapture(str(in_path))
         if not cap.isOpened():
@@ -437,8 +440,10 @@ class Soccer2DTrackingPipeline:
         elif int(max_frames) <= 0:
             max_frames = None
 
-        fps = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        raw_fps = float(cap.get(cv2.CAP_PROP_FPS)) or 25.0
+        fps = raw_fps / float(stride)
+        raw_total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        total_frames = (raw_total_frames + stride - 1) // stride if raw_total_frames > 0 else 0
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
         target_frames = (
@@ -451,9 +456,10 @@ class Soccer2DTrackingPipeline:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         self._reset_all_states()
 
+        stride_msg = f" (Submuestreo x{stride}: {raw_fps:.1f} -> {fps:.1f} FPS)" if stride > 1 else ""
         print("=" * 72)
         print("🚀 INICIANDO PIPELINE DE VIDEO (2 PASADAS: KALMAN 2D + GLOBAL STITCHING)")
-        print(f"   Video Entrada:      {in_path.name} ({target_frames} cuadros @ {fps:.1f} FPS)")
+        print(f"   Video Entrada:      {in_path.name} ({target_frames} cuadros @ {fps:.1f} FPS){stride_msg}")
         print(f"   Método Estabiliz.:  {self.stabilizer.stabilization_method.upper()}")
         print(f"   Confianza Jugador:  {self.detector.conf_player:.2f} | Balón: {self.detector.conf_ball:.2f}")
         print(f"   Modo 2 Pasadas:     {'ACTIVADO (Pasada 1 + Pasada 2 Tabular)' if self.enable_two_pass else 'DESACTIVADO (1 Pasada)'}")
@@ -474,7 +480,7 @@ class Soccer2DTrackingPipeline:
         frame_idx = 0
 
         # Lector asíncrono con buffer multihilo en RAM (384 cuadros ~ 2.4 GB RAM, ideal para los 53 GB de Colab)
-        reader = ThreadedVideoReader(in_path, queue_size=384, max_frames=max_frames)
+        reader = ThreadedVideoReader(in_path, queue_size=384, max_frames=max_frames, stride=stride)
 
         try:
             for frame_idx, frame_bgr in reader:
@@ -560,7 +566,7 @@ class Soccer2DTrackingPipeline:
         render_elapsed = 0.0
         if render_video:
             print("▶ Renderizando video final con trayectorias 2D cosidas y traza continua de balón...")
-            reader_render = ThreadedVideoReader(in_path, queue_size=256, max_frames=frame_idx)
+            reader_render = ThreadedVideoReader(in_path, queue_size=256, max_frames=frame_idx, stride=stride)
             writer = None
             render_idx = 0
             self.renderer.reset_trails()
@@ -707,6 +713,7 @@ class Soccer2DTrackingPipeline:
         output_path: Optional[Union[str, Path]] = None,
         max_frames: Optional[int] = None,
         render_video: bool = True,
+        stride: int = 1,
     ) -> Path:
         """Detecta automáticamente si la entrada es imagen o video y ejecuta el procesamiento."""
         in_path = Path(input_path)
@@ -719,6 +726,7 @@ class Soccer2DTrackingPipeline:
                 output_path=output_path,
                 max_frames=max_frames,
                 render_video=render_video,
+                stride=stride,
             )
         raise ValueError(
             f"Formato de archivo no soportado ({ext}). Use imagen {sorted(IMAGE_EXTENSIONS)} o video {sorted(VIDEO_EXTENSIONS)}."
@@ -807,6 +815,12 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Omitir el codificado del video MP4 y exportar únicamente los JSONs y CSVs sincerados",
     )
+    parser.add_argument(
+        "--stride", "--fps-stride",
+        type=int,
+        default=None,
+        help="Submuestreo temporal de fotogramas (ej: 2 procesa a ~29 FPS nativos de broadcast, reduciendo el tiempo a la mitad)",
+    )
     return parser.parse_args()
 
 
@@ -832,6 +846,7 @@ def main() -> None:
         output_path=args.output,
         max_frames=args.max_frames,
         render_video=(not args.no_render_video),
+        stride=(args.stride or 1),
     )
 
 
