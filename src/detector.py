@@ -143,19 +143,14 @@ class SoccerInferenceEngine:
             if hasattr(m, "overrides"):
                 m.overrides["imgsz"] = self.imgsz
 
-        # Inicializar CUDA Streams paralelos y pre-calentar motores TensorRT/CUDA en VRAM
+        # Inicializar aceleración CUDA y pre-calentar motores TensorRT/CUDA en VRAM
         self.is_cuda = ("cuda" in self.device) and torch.cuda.is_available()
+        self.stream_player = None
+        self.stream_kp = None
+        self.stream_ball = None
+        self._gpu_pool = None
         if self.is_cuda:
-            self.stream_player = torch.cuda.Stream()
-            self.stream_kp = torch.cuda.Stream()
-            self.stream_ball = torch.cuda.Stream()
-            self._gpu_pool = ThreadPoolExecutor(max_workers=3)
             self._warmup_models()
-        else:
-            self.stream_player = None
-            self.stream_kp = None
-            self.stream_ball = None
-            self._gpu_pool = None
 
     def _warmup_models(self) -> None:
         """
@@ -257,10 +252,10 @@ class SoccerInferenceEngine:
         Super-pipeline de inferencia en GPU (NVIDIA L4):
         1. Sube `frame_bgr` por PCIe a VRAM una sola vez por fotograma.
         2. Calcula el tensor `LetterBox` en GPU una sola vez y lo comparte entre motores.
-        3. Ejecuta solo los modelos necesarios de forma asíncrona.
+        3. Ejecución secuencial optimizada: aprovecha el 100% de la caché L2 y Tensor Cores sin contención.
         Retorna: (players, raw_kps, ball_cands, roi_used)
         """
-        if not self.is_cuda or self._gpu_pool is None:
+        if not self.is_cuda:
             players = self.infer_players(frame_bgr, is_video=True) if run_players else []
             if not players and run_players:
                 return [], {}, [], False
@@ -281,166 +276,157 @@ class SoccerInferenceEngine:
         gpu_rgb = self._upload_frame_to_gpu(frame_bgr)
         full_padded, scale, pad_x, pad_y = self._gpu_letterbox(gpu_rgb, imgsz=self.imgsz)
 
-        # Preparar tensor de entrada para el balón (ROI en VRAM o reutilizar full_padded)
-        roi_used = False
-        b_scale, b_pad_x, b_pad_y = scale, pad_x, pad_y
-        rx1, ry1, rx2, ry2 = 0, 0, w_orig, h_orig
-        ball_input_tensor = full_padded
-
-        if run_ball and ball_roi_box is not None:
-            rx1, ry1, rx2, ry2 = ball_roi_box
-            if (rx2 - rx1) > 8 and (ry2 - ry1) > 8:
-                gpu_roi = gpu_rgb[:, :, ry1:ry2, rx1:rx2]
-                ball_input_tensor, b_scale, b_pad_x, b_pad_y = self._gpu_letterbox(
-                    gpu_roi, imgsz=self.imgsz
-                )
-                roi_used = True
-
-        # Sincronizar el stream por defecto antes de abrir las ramas de inferencia
-        prep_event = torch.cuda.Event()
-        prep_event.record()
-
-        def _task_players():
-            with torch.cuda.stream(self.stream_player):
-                self.stream_player.wait_event(prep_event)
-                return self.player_model.predict(
-                    source=full_padded,
-                    imgsz=self.imgsz,
-                    conf=self.conf_player,
-                    classes=self.player_classes,
-                    device=self.device,
-                    half=self.half,
-                    verbose=False,
-                )[0]
-
-        def _task_keypoints():
-            with torch.cuda.stream(self.stream_kp):
-                self.stream_kp.wait_event(prep_event)
-                return self.keypoint_model.predict(
-                    source=full_padded,
-                    imgsz=self.imgsz,
-                    conf=self.conf_keypoint,
-                    device=self.device,
-                    half=self.half,
-                    verbose=False,
-                )[0]
-
-        def _task_ball():
-            with torch.cuda.stream(self.stream_ball):
-                self.stream_ball.wait_event(prep_event)
-                return self.ball_model.predict(
-                    source=ball_input_tensor,
-                    imgsz=self.imgsz,
-                    conf=float(ball_conf_low),
-                    device=self.device,
-                    half=self.half,
-                    verbose=False,
-                )[0]
-
-        fut_p = self._gpu_pool.submit(_task_players) if run_players else None
-        fut_kp = self._gpu_pool.submit(_task_keypoints) if run_keypoints else None
-        fut_b = self._gpu_pool.submit(_task_ball) if run_ball else None
-
-        res_p = fut_p.result() if fut_p is not None else None
-        res_kp = fut_kp.result() if fut_kp is not None else None
-        res_b = fut_b.result() if fut_b is not None else None
-
-        # Sincronización única consolidada de GPU tras completar las tareas
-        torch.cuda.synchronize()
-
-        # 1. Decodificar jugadores (deshaciendo LetterBox a coordenadas originales w_orig x h_orig)
+        # ---------------------------------------------------------------------
+        # ETAPA 1: Inferencia de Jugadores (Prioridad Alta)
+        # ---------------------------------------------------------------------
         players: List[Dict[str, Any]] = []
-        if res_p is not None and res_p.boxes is not None and len(res_p.boxes) > 0:
-            boxes_net = res_p.boxes.xyxy.cpu().numpy()
-            confs = res_p.boxes.conf.cpu().numpy()
-            classes = res_p.boxes.cls.cpu().numpy().astype(int)
+        if run_players:
+            res_p = self.player_model.predict(
+                source=full_padded,
+                imgsz=self.imgsz,
+                conf=self.conf_player,
+                classes=self.player_classes,
+                device=self.device,
+                half=self.half,
+                verbose=False,
+            )[0]
 
-            for idx, (box, score, cls_id) in enumerate(zip(boxes_net, confs, classes)):
-                if float(score) < self.conf_player:
-                    continue
-                x1 = float(np.clip((box[0] - pad_x) / scale, 0.0, float(w_orig)))
-                y1 = float(np.clip((box[1] - pad_y) / scale, 0.0, float(h_orig)))
-                x2 = float(np.clip((box[2] - pad_x) / scale, 0.0, float(w_orig)))
-                y2 = float(np.clip((box[3] - pad_y) / scale, 0.0, float(h_orig)))
-                foot_x = (x1 + x2) / 2.0
-                foot_y = y2
-                role = self.class_names.get(int(cls_id), self.class_names.get(str(cls_id), f"Cls{cls_id}"))
-                color_bgr = (0, 215, 255) if int(cls_id) == 3 else (255, 190, 0)
+            if res_p is not None and res_p.boxes is not None and len(res_p.boxes) > 0:
+                boxes_net = res_p.boxes.xyxy.cpu().numpy()
+                confs = res_p.boxes.conf.cpu().numpy()
+                classes = res_p.boxes.cls.cpu().numpy().astype(int)
 
-                players.append({
-                    "id": idx + 1,
-                    "class_id": int(cls_id),
-                    "role": role,
-                    "conf": float(score),
-                    "bbox": [x1, y1, x2, y2],
-                    "foot_px": (foot_x, foot_y),
-                    "pitch_m": None,
-                    "color_bgr": color_bgr,
-                })
+                for idx, (box, score, cls_id) in enumerate(zip(boxes_net, confs, classes)):
+                    if float(score) < self.conf_player:
+                        continue
+                    x1 = float(np.clip((box[0] - pad_x) / scale, 0.0, float(w_orig)))
+                    y1 = float(np.clip((box[1] - pad_y) / scale, 0.0, float(h_orig)))
+                    x2 = float(np.clip((box[2] - pad_x) / scale, 0.0, float(w_orig)))
+                    y2 = float(np.clip((box[3] - pad_y) / scale, 0.0, float(h_orig)))
+                    foot_x = (x1 + x2) / 2.0
+                    foot_y = y2
+                    role = self.class_names.get(int(cls_id), self.class_names.get(str(cls_id), f"Cls{cls_id}"))
+                    color_bgr = (0, 215, 255) if int(cls_id) == 3 else (255, 190, 0)
 
-        if not players:
-            return [], {}, [], False
+                    players.append({
+                        "id": idx + 1,
+                        "class_id": int(cls_id),
+                        "role": role,
+                        "conf": float(score),
+                        "bbox": [x1, y1, x2, y2],
+                        "foot_px": (foot_x, foot_y),
+                        "pitch_m": None,
+                        "color_bgr": color_bgr,
+                    })
 
-        # 2. Decodificar keypoints (aplicando filtro de exclusión sobre cajas de jugadores)
+            # Early Exit: Si se buscaban jugadores pero no hay ninguno (toma de tribuna,
+            # plano cerrado del DT o corte publicitario), no gastar cómputo en keypoints ni balón.
+            if not players:
+                return [], {}, [], False
+
+        # ---------------------------------------------------------------------
+        # ETAPA 2: Inferencia de Keypoints de Cancha (Cadencia Selectiva)
+        # ---------------------------------------------------------------------
         raw_kps: Dict[int, Tuple[float, float, float]] = {}
-        if res_kp is not None and res_kp.keypoints is not None and res_kp.keypoints.xy is not None and len(res_kp.keypoints.xy) > 0:
-            kps_xy_net = res_kp.keypoints.xy[0].cpu().numpy()
-            kps_conf = (
-                res_kp.keypoints.conf[0].cpu().numpy()
-                if res_kp.keypoints.conf is not None
-                else np.ones(len(kps_xy_net), dtype=np.float32)
-            )
-            margin = 3.0
-            player_boxes = [p["bbox"] for p in players]
+        if run_keypoints:
+            res_kp = self.keypoint_model.predict(
+                source=full_padded,
+                imgsz=self.imgsz,
+                conf=self.conf_keypoint,
+                device=self.device,
+                half=self.half,
+                verbose=False,
+            )[0]
 
-            for idx, ((kx_net, ky_net), kconf) in enumerate(zip(kps_xy_net, kps_conf)):
-                score = float(kconf)
-                if score < self.conf_keypoint:
-                    continue
-                kx = float((kx_net - pad_x) / scale)
-                ky = float((ky_net - pad_y) / scale)
-                if kx <= margin or kx >= (w_orig - margin) or ky <= margin or ky >= (h_orig - margin):
-                    continue
+            if (
+                res_kp is not None
+                and res_kp.keypoints is not None
+                and res_kp.keypoints.xy is not None
+                and len(res_kp.keypoints.xy) > 0
+            ):
+                kps_xy_net = res_kp.keypoints.xy[0].cpu().numpy()
+                kps_conf = (
+                    res_kp.keypoints.conf[0].cpu().numpy()
+                    if res_kp.keypoints.conf is not None
+                    else np.ones(len(kps_xy_net), dtype=np.float32)
+                )
+                margin = 3.0
+                player_boxes = [p["bbox"] for p in players]
 
-                inside_player = False
-                for bx1, by1, bx2, by2 in player_boxes:
-                    if bx1 <= kx <= bx2 and by1 <= ky <= (by2 - 4.0):
-                        inside_player = True
-                        break
-                if inside_player:
-                    continue
+                for idx, ((kx_net, ky_net), kconf) in enumerate(zip(kps_xy_net, kps_conf)):
+                    score = float(kconf)
+                    if score < self.conf_keypoint:
+                        continue
+                    kx = float((kx_net - pad_x) / scale)
+                    ky = float((ky_net - pad_y) / scale)
+                    if kx <= margin or kx >= (w_orig - margin) or ky <= margin or ky >= (h_orig - margin):
+                        continue
 
-                raw_kps[int(idx)] = (kx, ky, score)
+                    inside_player = False
+                    for bx1, by1, bx2, by2 in player_boxes:
+                        if bx1 <= kx <= bx2 and by1 <= ky <= (by2 - 4.0):
+                            inside_player = True
+                            break
+                    if inside_player:
+                        continue
 
-        # 3. Decodificar candidatos de balón
+                    raw_kps[int(idx)] = (kx, ky, score)
+
+        # ---------------------------------------------------------------------
+        # ETAPA 3: Inferencia de Balón (Micro-ROI o Full-Padded)
+        # ---------------------------------------------------------------------
         ball_cands: List[Dict[str, Any]] = []
-        if res_b is not None and res_b.boxes is not None and len(res_b.boxes) > 0:
-            boxes_b = res_b.boxes.xyxy.cpu().numpy()
-            confs_b = res_b.boxes.conf.cpu().numpy()
-            classes_b = res_b.boxes.cls.cpu().numpy().astype(int)
-            order = np.argsort(-confs_b)
-            roi_w = float(rx2 - rx1)
-            roi_h = float(ry2 - ry1)
+        roi_used = False
+        if run_ball:
+            b_scale, b_pad_x, b_pad_y = scale, pad_x, pad_y
+            rx1, ry1, rx2, ry2 = 0, 0, w_orig, h_orig
+            ball_input_tensor = full_padded
 
-            for rank, idx in enumerate(order):
-                score = float(confs_b[idx])
-                if score < ball_conf_low:
-                    continue
-                b_box = boxes_b[idx]
-                lx1 = float(np.clip((b_box[0] - b_pad_x) / b_scale, 0.0, roi_w)) + rx1
-                ly1 = float(np.clip((b_box[1] - b_pad_y) / b_scale, 0.0, roi_h)) + ry1
-                lx2 = float(np.clip((b_box[2] - b_pad_x) / b_scale, 0.0, roi_w)) + rx1
-                ly2 = float(np.clip((b_box[3] - b_pad_y) / b_scale, 0.0, roi_h)) + ry1
-                ball_cands.append({
-                    "id": rank + 1,
-                    "class_id": int(classes_b[idx]),
-                    "role": "Ball",
-                    "conf": score,
-                    "bbox": [lx1, ly1, lx2, ly2],
-                    "center_px": ((lx1 + lx2) / 2.0, (ly1 + ly2) / 2.0),
-                    "pitch_m": None,
-                    "from_roi": roi_used,
-                })
+            if ball_roi_box is not None:
+                rx1, ry1, rx2, ry2 = ball_roi_box
+                if (rx2 - rx1) > 8 and (ry2 - ry1) > 8:
+                    gpu_roi = gpu_rgb[:, :, ry1:ry2, rx1:rx2]
+                    ball_input_tensor, b_scale, b_pad_x, b_pad_y = self._gpu_letterbox(
+                        gpu_roi, imgsz=self.imgsz
+                    )
+                    roi_used = True
+
+            res_b = self.ball_model.predict(
+                source=ball_input_tensor,
+                imgsz=self.imgsz,
+                conf=float(ball_conf_low),
+                device=self.device,
+                half=self.half,
+                verbose=False,
+            )[0]
+
+            if res_b is not None and res_b.boxes is not None and len(res_b.boxes) > 0:
+                boxes_b = res_b.boxes.xyxy.cpu().numpy()
+                confs_b = res_b.boxes.conf.cpu().numpy()
+                classes_b = res_b.boxes.cls.cpu().numpy().astype(int)
+                order = np.argsort(-confs_b)
+                roi_w = float(rx2 - rx1)
+                roi_h = float(ry2 - ry1)
+
+                for rank, idx in enumerate(order):
+                    score = float(confs_b[idx])
+                    if score < ball_conf_low:
+                        continue
+                    b_box = boxes_b[idx]
+                    lx1 = float(np.clip((b_box[0] - b_pad_x) / b_scale, 0.0, roi_w)) + rx1
+                    ly1 = float(np.clip((b_box[1] - b_pad_y) / b_scale, 0.0, roi_h)) + ry1
+                    lx2 = float(np.clip((b_box[2] - b_pad_x) / b_scale, 0.0, roi_w)) + rx1
+                    ly2 = float(np.clip((b_box[3] - b_pad_y) / b_scale, 0.0, roi_h)) + ry1
+                    ball_cands.append({
+                        "id": rank + 1,
+                        "class_id": int(classes_b[idx]),
+                        "role": "Ball",
+                        "conf": score,
+                        "bbox": [lx1, ly1, lx2, ly2],
+                        "center_px": ((lx1 + lx2) / 2.0, (ly1 + ly2) / 2.0),
+                        "pitch_m": None,
+                        "from_roi": roi_used,
+                    })
 
         return players, raw_kps, ball_cands, roi_used
 
