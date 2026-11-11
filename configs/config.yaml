@@ -126,9 +126,9 @@ ball_tracking:
   player_occlusion_radius_px: 58.0
 
   reconstruction:
-    max_ball_speed_mps: 38.0     # Filtro anti-picos (Spike Removal) en Pasada 2
-    max_spike_jump_px: 160.0
-    max_interp_gap_frames: 35    # Hueco máximo a reconstruir a traza continua (sin corte de cámara)
+    max_ball_speed_mps: 34.0     # Filtro anti-picos (Spike Removal) en Pasada 2
+    max_spike_jump_px: 120.0
+    max_interp_gap_frames: 18    # Hueco máximo a reconstruir a traza continua (evita tender puentes entre jugadas separadas)
     enable_smoothing: true       # Suavizado preservador de rebotes y pases
 
 # Configuración de Visualización, Video y Plano 2D
@@ -142,7 +142,7 @@ visualization:
   draw_hud_banner: false         # Omitir banner superior de estado
   minimap_scale: 7.0             # Píxeles por metro en el plano 2D
   minimap_padding_m: 5.0         # Margen exterior en metros alrededor de la cancha 2D
-  trail_length: 35               # Cantidad de fotogramas de estela de movimiento en el plano 2D
+  trail_length: 20               # Cantidad de fotogramas de estela sincronizada en video y plano 2D
   enable_voronoi_apollonius: false # Desactivado: elimina las rayas de Voronoi y muestra el área proyectada de cámara
   draw_camera_frustum: true        # Muestra el área proyectada de la cámara en el plano 2D (tal como la segunda imagen)
   spatial_overlay_alpha: 0.22    # Transparencia del mapa de dominio territorial en el minimapa 2D

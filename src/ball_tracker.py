@@ -799,6 +799,94 @@ class BallTrajectoryReconstructor:
 
         return removed
 
+    def _prune_isolated_phantom_tracklets(self, rows: List[Dict[str, Any]]) -> int:
+        """
+        Poda tracklets fantasma o falsos positivos aislados:
+        Agrupa detecciones consecutivas (hueco <= 2 frames). Si un grupo tiene longitud <= 3 frames,
+        y está separado por más de 12 metros o 180 píxeles del grupo contiguo sin conexión cinemática,
+        se descarta como falso positivo para evitar que la interpolación tienda puentes falsos a través del campo.
+        """
+        detected_indices = [
+            i for i, r in enumerate(rows)
+            if r.get("detected", False)
+            and r.get("center_px_x") is not None
+            and r.get("center_px_y") is not None
+        ]
+        if len(detected_indices) < 2:
+            return 0
+
+        clusters: List[List[int]] = []
+        curr_cluster = [detected_indices[0]]
+        for k in range(1, len(detected_indices)):
+            prev_i = curr_cluster[-1]
+            curr_i = detected_indices[k]
+            f_prev = int(rows[prev_i]["frame"])
+            f_curr = int(rows[curr_i]["frame"])
+            if (f_curr - f_prev) <= 2 and not rows[curr_i].get("shot_cut"):
+                curr_cluster.append(curr_i)
+            else:
+                clusters.append(curr_cluster)
+                curr_cluster = [curr_i]
+        if curr_cluster:
+            clusters.append(curr_cluster)
+
+        if len(clusters) <= 1:
+            return 0
+
+        pruned = 0
+        for c_idx, cluster in enumerate(clusters):
+            # Solo podar clusters de muy corta duración (<= 2 frames) que estén desconectados del juego
+            if len(cluster) > 2:
+                continue
+
+            first_r = rows[cluster[0]]
+            last_r = rows[cluster[-1]]
+
+            is_isolated_prev = False
+            if c_idx > 0:
+                prev_cluster = clusters[c_idx - 1]
+                prev_last_r = rows[prev_cluster[-1]]
+                dt_p = (int(first_r["frame"]) - int(prev_last_r["frame"])) / self.fps
+                dp_px = float(np.hypot(
+                    float(first_r["center_px_x"]) - float(prev_last_r["center_px_x"]),
+                    float(first_r["center_px_y"]) - float(prev_last_r["center_px_y"]),
+                ))
+                if dp_px > (55.0 * (dt_p * self.fps) + 30.0) or dp_px > 180.0:
+                    is_isolated_prev = True
+
+            is_isolated_next = False
+            if c_idx < len(clusters) - 1:
+                next_cluster = clusters[c_idx + 1]
+                next_first_r = rows[next_cluster[0]]
+                dt_n = (int(next_first_r["frame"]) - int(last_r["frame"])) / self.fps
+                dn_px = float(np.hypot(
+                    float(next_first_r["center_px_x"]) - float(last_r["center_px_x"]),
+                    float(next_first_r["center_px_y"]) - float(last_r["center_px_y"]),
+                ))
+                if dn_px > (55.0 * (dt_n * self.fps) + 30.0) or dn_px > 180.0:
+                    is_isolated_next = True
+
+            should_prune = False
+            if c_idx == 0 and is_isolated_next:
+                should_prune = True
+            elif c_idx == len(clusters) - 1 and is_isolated_prev:
+                should_prune = True
+            elif is_isolated_prev and is_isolated_next:
+                should_prune = True
+
+            if should_prune:
+                for idx in cluster:
+                    rows[idx]["detected"] = False
+                    rows[idx]["state"] = "PHANTOM_PRUNED"
+                    rows[idx]["center_px_x"] = None
+                    rows[idx]["center_px_y"] = None
+                    rows[idx]["pitch_x_m"] = None
+                    rows[idx]["pitch_y_m"] = None
+                    rows[idx]["is_interpolated"] = True
+                    pruned += 1
+
+        return pruned
+
     def reconstruct(
         self,
         raw_ball_records: List[Dict[str, Any]],
@@ -818,10 +906,11 @@ class BallTrajectoryReconstructor:
         rows = [dict(r) for r in raw_ball_records]
         rows.sort(key=lambda r: int(r["frame"]))
 
-        # Paso 1: Eliminar picos cinemáticos imposibles y saltos bruscos
+        # Paso 1: Eliminar picos cinemáticos imposibles, saltos bruscos y clusters fantasma aislados
         spikes_removed = self._remove_kinematic_spikes(rows)
         jumps_removed = self._filter_frame_to_frame_jumps(rows)
-        spikes_removed += jumps_removed
+        phantoms_pruned = self._prune_isolated_phantom_tracklets(rows)
+        spikes_removed += (jumps_removed + phantoms_pruned)
 
         # Paso 2: Interpolar huecos acotados (<= max_interp_gap_frames) sin corte de cámara
         detected_idxs = [
@@ -863,13 +952,24 @@ class BallTrajectoryReconstructor:
                         float(r_b["pitch_y_m"]) - float(r_a["pitch_y_m"]),
                     )
                 )
-                if dist_m > (self.max_ball_speed_mps * dt_sec + 5.0):
+                req_speed = dist_m / max(1e-3, dt_sec)
+                # Si la distancia es mayor a 7m y la velocidad no corresponde a un pase en juego, no tender puente
+                if dist_m > 7.0 and (req_speed > self.max_ball_speed_mps or req_speed < 2.0):
+                    continue
+                if dist_m > (self.max_ball_speed_mps * dt_sec + 3.0):
+                    continue
+            else:
+                dist_px = float(
+                    np.hypot(
+                        float(r_b["center_px_x"]) - float(r_a["center_px_x"]),
+                        float(r_b["center_px_y"]) - float(r_a["center_px_y"]),
+                    )
+                )
+                if dist_px > (65.0 * (gap_len + 1) + 35.0):
                     continue
 
-            # Evaluar si existe un toque/rebote intermedio según el Círculo de Apolonio (A -> M -> B)
-            pivot = find_apollonius_intermediate_touch(
-                r_a, r_b, self.fps, stitched_players_by_frame, self.max_ball_speed_mps
-            )
+            # Para la trayectoria visual, el balón en vuelo libre debe mantener una trayectoria suave y directa
+            pivot = None
 
             for m in range(idx_a + 1, idx_b):
                 alpha = float(m - idx_a) / float(idx_b - idx_a)

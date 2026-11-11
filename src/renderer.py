@@ -37,7 +37,7 @@ class Tactical2DRenderer:
         self.ancho_cancha = float(pitch_cfg.get("ancho_cancha", ANCHO_CANCHA))
         self.scale = float(vis_cfg.get("minimap_scale", 7.0))
         self.padding_m = float(vis_cfg.get("minimap_padding_m", 5.0))
-        self.trail_length = int(vis_cfg.get("trail_length", 35))
+        self.trail_length = int(vis_cfg.get("trail_length", 20))
         self.clean_view = bool(vis_cfg.get("clean_view", True))
         self.draw_projected_lines = bool(vis_cfg.get("draw_projected_lines", not self.clean_view))
         self.draw_keypoints = bool(vis_cfg.get("draw_keypoints", True))
@@ -50,10 +50,10 @@ class Tactical2DRenderer:
         self.pitch_segments = get_pitch_line_segments(self.largo_cancha, self.ancho_cancha)
         self.base_pitch_2d, self.pad_px = self._create_2d_pitch_template()
 
-        # Historial de trayectorias 2D (en metros) y en cámara para videos
+        # Historial de trayectorias 2D (en metros) y en cámara para videos (estrictamente sincronizados)
         self.player_trails_2d: Dict[int, deque] = {}
         self.ball_trail_2d: deque = deque(maxlen=self.trail_length)
-        self.ball_trail_cam: deque = deque(maxlen=20)
+        self.ball_trail_cam: deque = deque(maxlen=self.trail_length)
 
     def reset_trails(self) -> None:
         """Reinicia las estelas de movimiento 2D cuando hay cambio de toma."""
@@ -263,8 +263,9 @@ class Tactical2DRenderer:
                 if len(self.ball_trail_cam) >= 1:
                     last_c = self.ball_trail_cam[-1]
                     jump_px = float(np.hypot(cx - last_c[0], cy - last_c[1]))
-                    if jump_px > 85.0:
+                    if jump_px > 80.0:
                         self.ball_trail_cam.clear()
+                        self.ball_trail_2d.clear()
                 self.ball_trail_cam.append((cx, cy))
 
             if len(self.ball_trail_cam) >= 2:
@@ -490,8 +491,9 @@ class Tactical2DRenderer:
                         if len(self.ball_trail_2d) >= 1:
                             last_2d = self.ball_trail_2d[-1]
                             jump_2d = float(np.hypot(bpx - last_2d[0], bpy - last_2d[1]))
-                            if jump_2d > (15.0 * self.scale):
+                            if jump_2d > (8.0 * self.scale):
                                 self.ball_trail_2d.clear()
+                                self.ball_trail_cam.clear()
                         self.ball_trail_2d.append((bpx, bpy))
 
                     if len(self.ball_trail_2d) >= 2:
