@@ -234,3 +234,29 @@ def test_frame_to_frame_jump_filter_and_pixel_smoothing():
     assert abs(f3["pitch_x_m"] - 52.0) < 1.0
 
 
+def test_prune_isolated_phantom_tracklets_prevents_bridges():
+    """Verifica que clusters fantasma aislados de 2 frames sean podados sin lanzar TypeError."""
+    reconstructor = BallTrajectoryReconstructor(fps=25.0)
+    raw_records = [
+        # Cluster 1: Detección fantasma de 2 frames en el círculo central
+        {"frame": 10, "detected": True, "center_px_x": 900.0, "center_px_y": 250.0, "pitch_x_m": 52.0, "pitch_y_m": 25.0, "conf": 0.35},
+        {"frame": 11, "detected": True, "center_px_x": 905.0, "center_px_y": 252.0, "pitch_x_m": 52.2, "pitch_y_m": 25.1, "conf": 0.38},
+        # Brecha sin detección
+        {"frame": 12, "detected": False, "center_px_x": None, "center_px_y": None, "pitch_x_m": None, "pitch_y_m": None, "conf": 0.0},
+        {"frame": 13, "detected": False, "center_px_x": None, "center_px_y": None, "pitch_x_m": None, "pitch_y_m": None, "conf": 0.0},
+        # Cluster 2: Balón real en la banda inferior (distante > 400px y > 30m)
+        {"frame": 20, "detected": True, "center_px_x": 400.0, "center_px_y": 800.0, "pitch_x_m": 53.0, "pitch_y_m": 60.0, "conf": 0.85},
+        {"frame": 21, "detected": True, "center_px_x": 415.0, "center_px_y": 800.0, "pitch_x_m": 54.0, "pitch_y_m": 60.0, "conf": 0.88},
+        {"frame": 22, "detected": True, "center_px_x": 430.0, "center_px_y": 800.0, "pitch_x_m": 55.0, "pitch_y_m": 60.0, "conf": 0.89},
+        {"frame": 23, "detected": True, "center_px_x": 445.0, "center_px_y": 800.0, "pitch_x_m": 56.0, "pitch_y_m": 60.0, "conf": 0.90},
+    ]
+
+    reconstructed, stats = reconstructor.reconstruct(raw_records)
+    assert stats["spikes_removed"] >= 2
+    # El cluster 1 debe estar podado
+    f10 = next(r for r in reconstructed if r["frame"] == 10)
+    assert f10["detected"] is False
+    assert f10["center_px_x"] is None
+
+
+

@@ -833,7 +833,7 @@ class BallTrajectoryReconstructor:
         if len(clusters) <= 1:
             return 0
 
-        pruned = 0
+        indices_to_prune = set()
         for c_idx, cluster in enumerate(clusters):
             # Solo podar clusters de muy corta duración (<= 2 frames) que estén desconectados del juego
             if len(cluster) > 2:
@@ -841,29 +841,43 @@ class BallTrajectoryReconstructor:
 
             first_r = rows[cluster[0]]
             last_r = rows[cluster[-1]]
+            if first_r.get("center_px_x") is None or last_r.get("center_px_x") is None:
+                continue
 
             is_isolated_prev = False
             if c_idx > 0:
                 prev_cluster = clusters[c_idx - 1]
-                prev_last_r = rows[prev_cluster[-1]]
-                dt_p = (int(first_r["frame"]) - int(prev_last_r["frame"])) / self.fps
-                dp_px = float(np.hypot(
-                    float(first_r["center_px_x"]) - float(prev_last_r["center_px_x"]),
-                    float(first_r["center_px_y"]) - float(prev_last_r["center_px_y"]),
-                ))
-                if dp_px > (55.0 * (dt_p * self.fps) + 30.0) or dp_px > 180.0:
+                prev_last_r = next(
+                    (rows[idx] for idx in reversed(prev_cluster) if rows[idx].get("center_px_x") is not None),
+                    None
+                )
+                if prev_last_r is not None:
+                    dt_p = max(1, int(first_r["frame"]) - int(prev_last_r["frame"])) / self.fps
+                    dp_px = float(np.hypot(
+                        float(first_r["center_px_x"]) - float(prev_last_r["center_px_x"]),
+                        float(first_r["center_px_y"]) - float(prev_last_r["center_px_y"]),
+                    ))
+                    if dp_px > (55.0 * (dt_p * self.fps) + 30.0) or dp_px > 180.0:
+                        is_isolated_prev = True
+                else:
                     is_isolated_prev = True
 
             is_isolated_next = False
             if c_idx < len(clusters) - 1:
                 next_cluster = clusters[c_idx + 1]
-                next_first_r = rows[next_cluster[0]]
-                dt_n = (int(next_first_r["frame"]) - int(last_r["frame"])) / self.fps
-                dn_px = float(np.hypot(
-                    float(next_first_r["center_px_x"]) - float(last_r["center_px_x"]),
-                    float(next_first_r["center_px_y"]) - float(last_r["center_px_y"]),
-                ))
-                if dn_px > (55.0 * (dt_n * self.fps) + 30.0) or dn_px > 180.0:
+                next_first_r = next(
+                    (rows[idx] for idx in next_cluster if rows[idx].get("center_px_x") is not None),
+                    None
+                )
+                if next_first_r is not None:
+                    dt_n = max(1, int(next_first_r["frame"]) - int(last_r["frame"])) / self.fps
+                    dn_px = float(np.hypot(
+                        float(next_first_r["center_px_x"]) - float(last_r["center_px_x"]),
+                        float(next_first_r["center_px_y"]) - float(last_r["center_px_y"]),
+                    ))
+                    if dn_px > (55.0 * (dt_n * self.fps) + 30.0) or dn_px > 180.0:
+                        is_isolated_next = True
+                else:
                     is_isolated_next = True
 
             should_prune = False
@@ -876,16 +890,18 @@ class BallTrajectoryReconstructor:
 
             if should_prune:
                 for idx in cluster:
-                    rows[idx]["detected"] = False
-                    rows[idx]["state"] = "PHANTOM_PRUNED"
-                    rows[idx]["center_px_x"] = None
-                    rows[idx]["center_px_y"] = None
-                    rows[idx]["pitch_x_m"] = None
-                    rows[idx]["pitch_y_m"] = None
-                    rows[idx]["is_interpolated"] = True
-                    pruned += 1
+                    indices_to_prune.add(idx)
 
-        return pruned
+        for idx in indices_to_prune:
+            rows[idx]["detected"] = False
+            rows[idx]["state"] = "PHANTOM_PRUNED"
+            rows[idx]["center_px_x"] = None
+            rows[idx]["center_px_y"] = None
+            rows[idx]["pitch_x_m"] = None
+            rows[idx]["pitch_y_m"] = None
+            rows[idx]["is_interpolated"] = True
+
+        return len(indices_to_prune)
 
     def reconstruct(
         self,
