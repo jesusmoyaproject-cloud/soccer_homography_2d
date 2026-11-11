@@ -28,6 +28,7 @@ from src.spatial_geometry import (
     select_apollonius_ball_carrier,
     find_apollonius_intermediate_touch,
 )
+from src.ball_physics_3d import CameraPose, classify_and_fit_flight_trajectory
 
 
 class BallState(str, Enum):
@@ -412,7 +413,11 @@ class BallPhysicsTracker:
                 "bbox": self.last_bbox,
                 "center_px": (round(filt_px[0], 2), round(filt_px[1], 2)),
                 "pitch_m": (round(pm[0], 3), round(pm[1], 3)) if pm is not None else None,
+                "optical_pitch_m": (round(pm[0], 3), round(pm[1], 3)) if pm is not None else None,
+                "height_m": 0.0,
+                "flight_phase": "GROUND_ROLL",
                 "speed_mps": round(speed_mps, 2),
+                "speed_3d_mps": round(speed_mps, 2),
                 "state": self.state.value,
                 "carrier_id": self.carrier_player_id,
                 "roi_used": bool(roi_used),
@@ -473,7 +478,11 @@ class BallPhysicsTracker:
                         "bbox": est_bbox,
                         "center_px": (round(px, 2), round(py, 2)),
                         "pitch_m": (round(pred_m[0], 3), round(pred_m[1], 3)) if pred_m is not None else None,
+                        "optical_pitch_m": (round(pred_m[0], 3), round(pred_m[1], 3)) if pred_m is not None else None,
+                        "height_m": 0.0,
+                        "flight_phase": "GROUND_ROLL",
                         "speed_mps": round(speed_mps, 2),
+                        "speed_3d_mps": round(speed_mps, 2),
                         "state": self.state.value,
                         "carrier_id": self.carrier_player_id,
                         "roi_used": bool(roi_used),
@@ -497,7 +506,12 @@ class BallPhysicsTracker:
                     "bbox_h": round(float(by2 - by1), 2),
                     "pitch_x_m": float(pm[0]) if pm is not None else None,
                     "pitch_y_m": float(pm[1]) if pm is not None else None,
+                    "optical_pitch_x_m": float(pm[0]) if pm is not None else None,
+                    "optical_pitch_y_m": float(pm[1]) if pm is not None else None,
+                    "height_m": 0.0,
+                    "flight_phase": "GROUND_ROLL",
                     "speed_mps": float(active_ball["speed_mps"]),
+                    "speed_3d_mps": float(active_ball["speed_mps"]),
                     "carrier_id": self.carrier_player_id,
                     "roi_used": bool(roi_used),
                     "homography_valid": bool(homography_valid),
@@ -519,7 +533,12 @@ class BallPhysicsTracker:
                     "bbox_h": 16.0,
                     "pitch_x_m": float(active_ball["pitch_m"][0]) if (active_ball and active_ball.get("pitch_m")) else None,
                     "pitch_y_m": float(active_ball["pitch_m"][1]) if (active_ball and active_ball.get("pitch_m")) else None,
+                    "optical_pitch_x_m": float(active_ball["pitch_m"][0]) if (active_ball and active_ball.get("pitch_m")) else None,
+                    "optical_pitch_y_m": float(active_ball["pitch_m"][1]) if (active_ball and active_ball.get("pitch_m")) else None,
+                    "height_m": 0.0,
+                    "flight_phase": "GROUND_ROLL",
                     "speed_mps": float(active_ball["speed_mps"]) if active_ball else 0.0,
+                    "speed_3d_mps": float(active_ball["speed_mps"]) if active_ball else 0.0,
                     "carrier_id": self.carrier_player_id,
                     "roi_used": bool(roi_used),
                     "homography_valid": bool(homography_valid),
@@ -667,12 +686,14 @@ class BallTrajectoryReconstructor:
         self,
         raw_ball_records: List[Dict[str, Any]],
         stitched_players_by_frame: Optional[Dict[int, List[Dict[str, Any]]]] = None,
+        camera_pose: Optional[CameraPose] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
         Ejecuta la reconstrucción post-inferencia completa sobre la serie del balón:
         1. Poda de picos espurios.
         2. Interpolación de huecos entre detecciones reales (guiada por jugador o lineal/Hermite).
         3. Suavizado ligero preservador de vértices y recálculo de velocidades.
+        4. Clasificación y ajuste balístico 3D (Parábolas aéreas y Efecto Magnus).
         """
         if not raw_ball_records:
             return [], {"total_frames": 0, "detected_frames": 0, "interpolated_frames": 0, "spikes_removed": 0}
@@ -810,6 +831,14 @@ class BallTrajectoryReconstructor:
         if self.enable_smoothing:
             self._smooth_and_compute_velocity(rows)
 
+        # Paso 4: Ajuste Balístico 3D, Parábolas y Efecto Magnus
+        rows = classify_and_fit_flight_trajectory(
+            rows,
+            camera_pose=camera_pose,
+            fps=self.fps,
+            max_ball_speed_mps=self.max_ball_speed_mps,
+        )
+
         detected_final = sum(1 for r in rows if r.get("detected", False))
         stats = {
             "total_frames": len(rows),
@@ -885,7 +914,15 @@ class BallTrajectoryReconstructor:
                     "bbox": [cx - bw / 2.0, cy - bh / 2.0, cx + bw / 2.0, cy + bh / 2.0],
                     "center_px": (float(cx), float(cy)),
                     "pitch_m": pm,
+                    "optical_pitch_m": (
+                        (float(r["optical_pitch_x_m"]), float(r["optical_pitch_y_m"]))
+                        if r.get("optical_pitch_x_m") is not None and r.get("optical_pitch_y_m") is not None
+                        else pm
+                    ),
+                    "height_m": float(r.get("height_m", 0.0)),
+                    "flight_phase": str(r.get("flight_phase", "GROUND_ROLL")),
                     "speed_mps": float(r.get("speed_mps", 0.0)),
+                    "speed_3d_mps": float(r.get("speed_3d_mps", r.get("speed_mps", 0.0))),
                     "state": str(r.get("state", "LOCKED")),
                     "carrier_id": r.get("carrier_id"),
                     "is_interpolated": bool(r.get("is_interpolated", False)),

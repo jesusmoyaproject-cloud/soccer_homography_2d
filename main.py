@@ -59,6 +59,7 @@ class Soccer2DTrackingPipeline:
         conf_ball_override: Optional[float] = None,
         two_pass_override: Optional[bool] = None,
         imgsz_override: Optional[int] = None,
+        clean_view_override: Optional[bool] = None,
     ):
         self.config = load_yaml_config(config_path)
 
@@ -72,6 +73,13 @@ class Soccer2DTrackingPipeline:
             self.config.setdefault("tracking_2d", {})["enable_two_pass"] = bool(two_pass_override)
         if imgsz_override is not None:
             self.config.setdefault("detection", {})["imgsz"] = int(imgsz_override)
+        if clean_view_override is not None:
+            vis_c = self.config.setdefault("visualization", {})
+            vis_c["clean_view"] = bool(clean_view_override)
+            if clean_view_override:
+                vis_c["draw_keypoints"] = False
+                vis_c["draw_hud_banner"] = False
+                vis_c["draw_projected_lines"] = False
 
         self.enable_two_pass = bool(
             self.config.get("tracking_2d", {}).get("enable_two_pass", True)
@@ -530,11 +538,21 @@ class Soccer2DTrackingPipeline:
         stitched_records, stitch_stats = stitcher.stitch_and_propagate(raw_records)
         stitched_by_frame = stitcher.build_frame_lookup(stitched_records)
 
-        # 2.3 Reconstrucción Post-Inferencia de la Traza Continua del Balón
+        # 2.3 Reconstrucción Post-Inferencia de la Traza Continua del Balón (Física 3D y Efecto Magnus)
+        cam_pose = None
+        for meta_item in frame_cache_meta.values():
+            h_obj = meta_item.get("homography")
+            if h_obj is not None and h_obj.is_valid and h_obj.H_inv is not None:
+                from src.ball_physics_3d import estimate_camera_pose_from_homography
+                cam_pose = estimate_camera_pose_from_homography(h_obj.H_inv, img_w=frame_width, img_h=frame_height)
+                if cam_pose is not None:
+                    break
+
         ball_reconstructor = BallTrajectoryReconstructor(config=self.config, fps=fps)
         reconstructed_ball_rows, ball_stats = ball_reconstructor.reconstruct(
             self.ball_tracker.tabular_records,
             stitched_players_by_frame=stitched_by_frame,
+            camera_pose=cam_pose,
         )
         reconstructed_balls_by_frame = ball_reconstructor.build_frame_lookup(reconstructed_ball_rows)
 
@@ -821,6 +839,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Submuestreo temporal de fotogramas (ej: 2 procesa a ~29 FPS nativos de broadcast, reduciendo el tiempo a la mitad)",
     )
+    parser.add_argument(
+        "--diagnostic",
+        action="store_true",
+        default=False,
+        help="Modo diagnóstico: muestra keypoints, líneas de homografía y banner de estado (por defecto está desactivado para un video limpio)",
+    )
     return parser.parse_args()
 
 
@@ -840,6 +864,7 @@ def main() -> None:
         conf_ball_override=args.conf_ball,
         two_pass_override=(False if args.single_pass else None),
         imgsz_override=args.imgsz,
+        clean_view_override=(False if args.diagnostic else True),
     )
     pipeline.process(
         input_path=input_source,

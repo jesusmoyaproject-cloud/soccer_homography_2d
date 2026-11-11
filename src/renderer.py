@@ -38,8 +38,10 @@ class Tactical2DRenderer:
         self.scale = float(vis_cfg.get("minimap_scale", 7.0))
         self.padding_m = float(vis_cfg.get("minimap_padding_m", 5.0))
         self.trail_length = int(vis_cfg.get("trail_length", 35))
-        self.draw_projected_lines = bool(vis_cfg.get("draw_projected_lines", True))
-        self.draw_keypoints = bool(vis_cfg.get("draw_keypoints", True))
+        self.clean_view = bool(vis_cfg.get("clean_view", True))
+        self.draw_projected_lines = bool(vis_cfg.get("draw_projected_lines", not self.clean_view))
+        self.draw_keypoints = bool(vis_cfg.get("draw_keypoints", not self.clean_view))
+        self.draw_hud_banner = bool(vis_cfg.get("draw_hud_banner", not self.clean_view))
         self.enable_voronoi_apollonius = bool(vis_cfg.get("enable_voronoi_apollonius", True))
         self.spatial_overlay_alpha = float(vis_cfg.get("spatial_overlay_alpha", 0.22))
 
@@ -207,72 +209,99 @@ class Tactical2DRenderer:
                 cv2.rectangle(out, (bx1, by1), (bx2, by2), kp_col, 1)
                 cv2.putText(out, kp_label, (bx1 + 2, by2 - 2), font, 0.38, (255, 255, 255), 1, lineType=cv2.LINE_AA)
 
-        # 3. Jugadores detectados (con ID y conf)
+        # 3. Jugadores detectados (solo IDs detectados y visualización limpia)
         for p in players:
             x1, y1, x2, y2 = [int(round(v)) for v in p["bbox"]]
-            fx, fy = int(round(p["foot_px"][0])), int(round(p["foot_px"][1]))
             col = tuple(p.get("color_bgr", (255, 180, 0)))
 
-            # Bounding box sutil y elipse de apoyo en el césped
+            # Bounding box nítido de 2 px
             cv2.rectangle(out, (x1, y1), (x2, y2), col, 2, lineType=cv2.LINE_AA)
-            axes = (max(6, int((x2 - x1) * 0.45)), max(4, int((y2 - y1) * 0.10)))
-            cv2.ellipse(out, (fx, fy), axes, 0, 0, 360, col, 2, lineType=cv2.LINE_AA)
 
             jersey_num = p.get("jersey_number")
-            jersey_tag = f" [#{jersey_num}]" if jersey_num else ""
-            label = f"ID:{p['id']}{jersey_tag} {p['role']} {p['conf']:.2f}"
-            (tw, th), _ = cv2.getTextSize(label, font, 0.45, 1)
-            bx1 = max(2, fx - tw // 2 - 4)
-            by2 = max(th + 6, y1 - 3)
-            by1 = by2 - th - 6
-            bx2 = bx1 + tw + 8
+            id_text = f"#{jersey_num}" if jersey_num else str(p["id"])
 
-            cv2.rectangle(out, (bx1, by1), (bx2, by2), (20, 20, 20), -1)
-            cv2.rectangle(out, (bx1, by1), (bx2, by2), col, 1, lineType=cv2.LINE_AA)
-            cv2.putText(out, label, (bx1 + 4, by2 - 4), font, 0.45, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+            if self.clean_view:
+                # Pastilla sólida minimalista con solo el ID detectado
+                label = id_text
+                font_scale = 0.44
+                (tw, th), _ = cv2.getTextSize(label, font, font_scale, 1)
+                bx1 = x1
+                by2 = max(th + 6, y1 - 3)
+                by1 = by2 - th - 5
+                bx2 = bx1 + tw + 8
 
-        # 4. Balón detectado o reconstruido (con ID, estado, conf y estela suave)
+                cv2.rectangle(out, (bx1, by1), (bx2, by2), col, -1, lineType=cv2.LINE_AA)
+                cv2.putText(out, label, (bx1 + 4, by2 - 3), font, font_scale, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+            else:
+                fx, fy = int(round(p["foot_px"][0])), int(round(p["foot_px"][1]))
+                axes = (max(6, int((x2 - x1) * 0.45)), max(4, int((y2 - y1) * 0.10)))
+                cv2.ellipse(out, (fx, fy), axes, 0, 0, 360, col, 2, lineType=cv2.LINE_AA)
+                jersey_tag = f" [#{jersey_num}]" if jersey_num else ""
+                label = f"ID:{p['id']}{jersey_tag} {p['role']} {p['conf']:.2f}"
+                (tw, th), _ = cv2.getTextSize(label, font, 0.45, 1)
+                bx1 = max(2, fx - tw // 2 - 4)
+                by2 = max(th + 6, y1 - 3)
+                by1 = by2 - th - 6
+                bx2 = bx1 + tw + 8
+                cv2.rectangle(out, (bx1, by1), (bx2, by2), (20, 20, 20), -1)
+                cv2.rectangle(out, (bx1, by1), (bx2, by2), col, 1, lineType=cv2.LINE_AA)
+                cv2.putText(out, label, (bx1 + 4, by2 - 4), font, 0.45, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+
+        # 4. Balón detectado o reconstruido
         if homog_res.shot_cut_histogram or homog_res.proximity_switch_triggered:
             self.ball_trail_cam.clear()
 
         for b in balls:
-            x1, y1, x2, y2 = [int(round(v)) for v in b["bbox"]]
             cx, cy = int(round(b["center_px"][0])), int(round(b["center_px"][1]))
             is_interp = bool(b.get("is_interpolated", False))
-            b_col = (0, 200, 255) if is_interp else (0, 140, 255)
+            b_col = (0, 215, 255) if is_interp else (0, 140, 255)
 
             self.ball_trail_cam.append((cx, cy))
             if len(self.ball_trail_cam) >= 2:
                 c_pts = np.array(list(self.ball_trail_cam), dtype=np.int32).reshape(-1, 1, 2)
                 cv2.polylines(out, [c_pts], isClosed=False, color=b_col, thickness=2, lineType=cv2.LINE_AA)
 
-            cv2.rectangle(out, (x1, y1), (x2, y2), b_col, 2, lineType=cv2.LINE_AA)
-            cv2.circle(out, (cx, cy), 6, b_col, -1, lineType=cv2.LINE_AA)
-            cv2.circle(out, (cx, cy), 8, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+            if self.clean_view:
+                # Marcador limpio de balón: círculos concéntricos y pastilla compacta
+                cv2.circle(out, (cx, cy), 6, b_col, -1, lineType=cv2.LINE_AA)
+                cv2.circle(out, (cx, cy), 8, (255, 255, 255), 2, lineType=cv2.LINE_AA)
+                label = "Ball"
+                (tw, th), _ = cv2.getTextSize(label, font, 0.38, 1)
+                bx1 = max(2, cx - tw // 2 - 3)
+                by2 = max(th + 6, cy - 10)
+                by1 = by2 - th - 4
+                bx2 = bx1 + tw + 6
+                cv2.rectangle(out, (bx1, by1), (bx2, by2), (20, 20, 20), -1, lineType=cv2.LINE_AA)
+                cv2.rectangle(out, (bx1, by1), (bx2, by2), b_col, 1, lineType=cv2.LINE_AA)
+                cv2.putText(out, label, (bx1 + 3, by2 - 3), font, 0.38, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+            else:
+                x1, y1, x2, y2 = [int(round(v)) for v in b["bbox"]]
+                cv2.rectangle(out, (x1, y1), (x2, y2), b_col, 2, lineType=cv2.LINE_AA)
+                cv2.circle(out, (cx, cy), 6, b_col, -1, lineType=cv2.LINE_AA)
+                cv2.circle(out, (cx, cy), 8, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+                state_tag = " [REC]" if is_interp else ""
+                b_label = f"Ball ID:{b['id']}{state_tag} {b['conf']:.2f}"
+                (tw, th), _ = cv2.getTextSize(b_label, font, 0.45, 1)
+                bx1 = max(2, cx - tw // 2 - 4)
+                by2 = max(th + 6, y1 - 4)
+                by1 = by2 - th - 6
+                bx2 = bx1 + tw + 8
+                cv2.rectangle(out, (bx1, by1), (bx2, by2), (15, 15, 15), -1)
+                cv2.rectangle(out, (bx1, by1), (bx2, by2), b_col, 1, lineType=cv2.LINE_AA)
+                cv2.putText(out, b_label, (bx1 + 4, by2 - 4), font, 0.45, (0, 230, 255), 1, lineType=cv2.LINE_AA)
 
-            state_tag = " [REC]" if is_interp else ""
-            b_label = f"Ball ID:{b['id']}{state_tag} {b['conf']:.2f}"
-            (tw, th), _ = cv2.getTextSize(b_label, font, 0.45, 1)
-            bx1 = max(2, cx - tw // 2 - 4)
-            by2 = max(th + 6, y1 - 4)
-            by1 = by2 - th - 6
-            bx2 = bx1 + tw + 8
-
-            cv2.rectangle(out, (bx1, by1), (bx2, by2), (15, 15, 15), -1)
-            cv2.rectangle(out, (bx1, by1), (bx2, by2), b_col, 1, lineType=cv2.LINE_AA)
-            cv2.putText(out, b_label, (bx1 + 4, by2 - 4), font, 0.45, (0, 230, 255), 1, lineType=cv2.LINE_AA)
-
-        # 5. Banner superior de estado (Homografía, Método de Estabilización y Alertas)
-        status_col = (0, 210, 80) if homog_res.is_valid else (0, 50, 255)
-        hud_text = (
-            f"Estab: {stabilization_mode.upper()} | {homog_res.status_message} | "
-            f"Players(>=0.5): {len(players)} | Ball(>=0.4): {len(balls)}"
-        )
-        (hud_w, hud_h), _ = cv2.getTextSize(hud_text, font, 0.58, 2)
-        box_w = min(out.shape[1] - 10, hud_w + 30)
-        cv2.rectangle(out, (10, 10), (box_w, 48), (15, 20, 30), -1)
-        cv2.rectangle(out, (10, 10), (box_w, 48), status_col, 2)
-        cv2.putText(out, hud_text, (20, 35), font, 0.58, (255, 255, 255), 2, lineType=cv2.LINE_AA)
+        # 5. Banner superior de estado (solo en modo diagnóstico, omitido en clean_view)
+        if not self.clean_view and self.draw_hud_banner:
+            status_col = (0, 210, 80) if homog_res.is_valid else (0, 50, 255)
+            hud_text = (
+                f"Estab: {stabilization_mode.upper()} | {homog_res.status_message} | "
+                f"Players(>=0.5): {len(players)} | Ball(>=0.4): {len(balls)}"
+            )
+            (hud_w, hud_h), _ = cv2.getTextSize(hud_text, font, 0.58, 2)
+            box_w = min(out.shape[1] - 10, hud_w + 30)
+            cv2.rectangle(out, (10, 10), (box_w, 48), (15, 20, 30), -1)
+            cv2.rectangle(out, (10, 10), (box_w, 48), status_col, 2)
+            cv2.putText(out, hud_text, (20, 35), font, 0.58, (255, 255, 255), 2, lineType=cv2.LINE_AA)
 
         return out
 
@@ -440,7 +469,7 @@ class Tactical2DRenderer:
                 lineType=cv2.LINE_AA,
             )
 
-        # Actualizar y dibujar trayectoria y posición 2D del balón
+        # Actualizar y dibujar trayectoria y posición 2D del balón (con física 3D y altura)
         if balls:
             best_ball = balls[0]
             bm = best_ball.get("pitch_m")
@@ -448,15 +477,35 @@ class Tactical2DRenderer:
                 bmx, bmy = bm
                 if -4.0 <= bmx <= self.largo_cancha + 4.0 and -4.0 <= bmy <= self.ancho_cancha + 4.0:
                     bpx, bpy = self._m_to_px(bmx, bmy)
+                    height_m = float(best_ball.get("height_m", 0.0))
+                    flight_phase = str(best_ball.get("flight_phase", "GROUND_ROLL"))
+
                     if update_trails:
                         self.ball_trail_2d.append((bpx, bpy))
 
                     if len(self.ball_trail_2d) >= 2:
                         bpts = np.array(list(self.ball_trail_2d), dtype=np.int32).reshape(-1, 1, 2)
-                        cv2.polylines(plane, [bpts], isClosed=False, color=(0, 165, 255), thickness=2, lineType=cv2.LINE_AA)
+                        trail_col = (0, 215, 255) if height_m > 0.4 else (0, 165, 255)
+                        cv2.polylines(plane, [bpts], isClosed=False, color=trail_col, thickness=2, lineType=cv2.LINE_AA)
 
-                    cv2.circle(plane, (bpx, bpy), 6, (0, 140, 255), -1, lineType=cv2.LINE_AA)
-                    cv2.circle(plane, (bpx, bpy), 8, (255, 255, 255), 2, lineType=cv2.LINE_AA)
+                    if height_m > 0.4:
+                        # 1. Sombra real sobre el césped
+                        cv2.ellipse(plane, (bpx, bpy), (7, 4), 0, 0, 360, (20, 50, 20), -1, lineType=cv2.LINE_AA)
+                        # 2. Vástago vertical de altitud
+                        stem_px = min(45, int(round(height_m * 4.2)))
+                        ball_draw_pt = (bpx, bpy - stem_px)
+                        cv2.line(plane, (bpx, bpy), ball_draw_pt, (200, 230, 255), 1, lineType=cv2.LINE_AA)
+                        # 3. Marcador aéreo con escala de radio por altura
+                        r_ball = 6 + min(3, int(round(height_m * 0.4)))
+                        cv2.circle(plane, ball_draw_pt, r_ball, (0, 220, 255), -1, lineType=cv2.LINE_AA)
+                        cv2.circle(plane, ball_draw_pt, r_ball + 2, (255, 255, 255), 2, lineType=cv2.LINE_AA)
+                        alt_txt = f"{height_m:.1f}m"
+                        if flight_phase == "CURVED_SHOT":
+                            alt_txt += " (Comba)"
+                        cv2.putText(plane, alt_txt, (bpx + 9, bpy - stem_px + 4), font, 0.32, (240, 255, 240), 1, lineType=cv2.LINE_AA)
+                    else:
+                        cv2.circle(plane, (bpx, bpy), 6, (0, 140, 255), -1, lineType=cv2.LINE_AA)
+                        cv2.circle(plane, (bpx, bpy), 8, (255, 255, 255), 2, lineType=cv2.LINE_AA)
 
         # Si se levantó bandera roja o es toma cerrada, indicarlo claramente en el plano 2D
         if not homog_res.is_valid:

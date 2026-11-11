@@ -557,6 +557,9 @@ class ScoutingJsonExporter:
                     "pixel_y": int(round(b_cy)),
                     "pitch_x": b_pitch_x,
                     "pitch_y": b_pitch_y,
+                    "height_m": round(float(b.get("height_m", 0.0)), 2),
+                    "speed_mps": round(float(b.get("speed_3d_mps", b.get("speed_mps", 0.0))), 2),
+                    "flight_phase": str(b.get("flight_phase", "GROUND_ROLL")),
                 }
                 if b_interp:
                     ball_json["is_interpolated"] = True
