@@ -42,7 +42,8 @@ class Tactical2DRenderer:
         self.draw_projected_lines = bool(vis_cfg.get("draw_projected_lines", not self.clean_view))
         self.draw_keypoints = bool(vis_cfg.get("draw_keypoints", not self.clean_view))
         self.draw_hud_banner = bool(vis_cfg.get("draw_hud_banner", not self.clean_view))
-        self.enable_voronoi_apollonius = bool(vis_cfg.get("enable_voronoi_apollonius", True))
+        self.draw_camera_frustum = bool(vis_cfg.get("draw_camera_frustum", True))
+        self.enable_voronoi_apollonius = bool(vis_cfg.get("enable_voronoi_apollonius", False))
         self.spatial_overlay_alpha = float(vis_cfg.get("spatial_overlay_alpha", 0.22))
 
         self.pitch_coords = build_pitch_coords_meters(self.largo_cancha, self.ancho_cancha)
@@ -256,7 +257,11 @@ class Tactical2DRenderer:
             is_interp = bool(b.get("is_interpolated", False))
             b_col = (0, 215, 255) if is_interp else (0, 140, 255)
 
-            self.ball_trail_cam.append((cx, cy))
+            # Solo añadir a la estela de cámara si es una detección real o reconstrucción en vuelo
+            # (evita dibujar líneas erráticas hacia los pies de jugadores en oclusiones especulativas)
+            if not (is_interp and b.get("state") == "OCCLUDED_BY_PLAYER"):
+                self.ball_trail_cam.append((cx, cy))
+
             if len(self.ball_trail_cam) >= 2:
                 c_pts = np.array(list(self.ball_trail_cam), dtype=np.int32).reshape(-1, 1, 2)
                 cv2.polylines(out, [c_pts], isClosed=False, color=b_col, thickness=2, lineType=cv2.LINE_AA)
@@ -305,6 +310,48 @@ class Tactical2DRenderer:
 
         return out
 
+    def compute_camera_frustum_polygon(
+        self,
+        H: Optional[np.ndarray],
+        cam_w: int = 1920,
+        cam_h: int = 1080,
+    ) -> Optional[np.ndarray]:
+        """
+        Calcula el polígono 2D en píxeles del canvas de la cancha que representa
+        el área proyectada visible por la cámara según la homografía (frustum de cámara).
+        """
+        if H is None:
+            return None
+
+        sample_pts = []
+        for u in np.linspace(0.0, float(cam_w), 25):
+            sample_pts.append((u, float(cam_h - 2)))
+        for v in np.linspace(float(cam_h - 2), 2.0, 20):
+            sample_pts.append((float(cam_w - 2), v))
+        for u in np.linspace(float(cam_w - 2), 0.0, 25):
+            sample_pts.append((u, 2.0))
+        for v in np.linspace(2.0, float(cam_h - 2), 20):
+            sample_pts.append((2.0, v))
+
+        canvas_pts = []
+        margin_m = 6.0
+        for u, v in sample_pts:
+            P = H @ np.array([u, v, 1.0], dtype=np.float64)
+            w = float(P[2])
+            if w <= 1e-4:
+                continue
+            xm = float(P[0] / w)
+            ym = float(P[1] / w)
+            if (-margin_m <= xm <= self.largo_cancha + margin_m) and (-margin_m <= ym <= self.ancho_cancha + margin_m):
+                px, py = self._m_to_px(xm, ym)
+                canvas_pts.append([px, py])
+
+        if len(canvas_pts) < 4:
+            return None
+
+        hull = cv2.convexHull(np.array(canvas_pts, dtype=np.int32))
+        return hull.reshape(-1, 2)
+
     def render_2d_plane(
         self,
         players: List[Dict[str, Any]],
@@ -313,8 +360,8 @@ class Tactical2DRenderer:
         update_trails: bool = True,
     ) -> np.ndarray:
         """
-        Genera la imagen del Plano 2D de la cancha con los keypoints activos y las posiciones
-        y movimientos (estelas) de los jugadores y el balón.
+        Genera la imagen del Plano 2D de la cancha con el área proyectada de la cámara
+        (trapezoide de cobertura visual) y las posiciones y movimientos limpios de jugadores y balón.
         """
         plane = self.base_pitch_2d.copy()
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -322,94 +369,45 @@ class Tactical2DRenderer:
         if homog_res.shot_cut_histogram or homog_res.proximity_switch_triggered:
             self.reset_trails()
 
-        # 1. Capa de Control Espacial (Diagramas de Voronoi y Apolonio Dinámico)
-        spatial_surf = None
-        if self.enable_voronoi_apollonius and homog_res.is_valid:
-            spatial_surf = compute_voronoi_and_apollonius_surface(
-                players,
-                largo_cancha=self.largo_cancha,
-                ancho_cancha=self.ancho_cancha,
-                grid_w=105,
-                grid_h=68,
-            )
-            if spatial_surf is not None:
-                w_pitch = int(round(self.largo_cancha * self.scale))
-                h_pitch = int(round(self.ancho_cancha * self.scale))
+        # 1. Base del Plano 2D: Área Proyectada de la Cámara (Frustum según Homografía)
+        if self.draw_camera_frustum and homog_res.is_valid and homog_res.H is not None:
+            frustum_poly = self.compute_camera_frustum_polygon(homog_res.H)
+            if frustum_poly is not None and len(frustum_poly) >= 3:
+                # Cancha oscurecida para la zona exterior fuera de la vista de la cámara
+                plane_dark = (self.base_pitch_2d.astype(np.float32) * 0.36).astype(np.uint8)
+
+                # Mantener las líneas de la cancha suavemente visibles en la zona exterior
                 pad = self.pad_px
-                roi_pitch = plane[pad : pad + h_pitch, pad : pad + w_pitch]
+                L, W_m = self.largo_cancha, self.ancho_cancha
+                line_dim = (90, 115, 90)
+                def to_p(x_m, y_m):
+                    return int(round(x_m * self.scale)) + pad, int(round(y_m * self.scale)) + pad
 
-                # Determinar colores representativos de Equipo A (1) y Equipo B (2)
-                col_a = next(
-                    (tuple(p.get("color_bgr", (255, 190, 0))) for p in players if int(p.get("team_id", 0)) == 1),
-                    (255, 190, 0),
-                )
-                col_b = next(
-                    (tuple(p.get("color_bgr", (50, 60, 245))) for p in players if int(p.get("team_id", 0)) == 2),
-                    (50, 60, 245),
-                )
+                cv2.rectangle(plane_dark, to_p(0, 0), to_p(L, W_m), line_dim, 1, lineType=cv2.LINE_AA)
+                cv2.line(plane_dark, to_p(L/2, 0), to_p(L/2, W_m), line_dim, 1, lineType=cv2.LINE_AA)
+                cv2.circle(plane_dark, to_p(L/2, W_m/2), int(round(9.15 * self.scale)), line_dim, 1, lineType=cv2.LINE_AA)
+                cv2.rectangle(plane_dark, to_p(0, W_m/2 - 20.16), to_p(16.5, W_m/2 + 20.16), line_dim, 1, lineType=cv2.LINE_AA)
+                cv2.rectangle(plane_dark, to_p(L - 16.5, W_m/2 - 20.16), to_p(L, W_m/2 + 20.16), line_dim, 1, lineType=cv2.LINE_AA)
 
-                apol_team = spatial_surf["apollonius_team_map"]
-                apol_owner = spatial_surf["apollonius_owner_idx"]
-                vor_owner = spatial_surf["voronoi_owner_idx"]
+                # Máscara del área proyectada
+                mask = np.zeros(plane.shape[:2], dtype=np.uint8)
+                cv2.fillPoly(mask, [frustum_poly], 255)
 
-                # Colorear grilla de Apolonio por equipo y escalar al tamaño de la cancha 2D
-                gh, gw = apol_team.shape
-                color_grid = np.zeros((gh, gw, 3), dtype=np.uint8)
-                color_grid[apol_team == 1] = col_a
-                color_grid[apol_team == 2] = col_b
-                overlay_resized = cv2.resize(color_grid, (w_pitch, h_pitch), interpolation=cv2.INTER_LINEAR)
-                cv2.addWeighted(
-                    overlay_resized,
-                    self.spatial_overlay_alpha,
-                    roi_pitch,
-                    1.0 - self.spatial_overlay_alpha,
-                    0,
-                    dst=roi_pitch,
-                )
+                # Combinar: zona visible activa (brillante) + zona exterior (oscurecida)
+                plane = np.where(mask[..., None] == 255, self.base_pitch_2d, plane_dark)
 
-                # Bordes de celdas individuales de Voronoi (sutiles) y de Apolonio (curvas cinemáticas)
-                vor_edge = np.zeros((gh, gw), dtype=np.uint8)
-                vor_edge[:, 1:] |= (vor_owner[:, 1:] != vor_owner[:, :-1]).astype(np.uint8) * 255
-                vor_edge[1:, :] |= (vor_owner[1:, :] != vor_owner[:-1, :]).astype(np.uint8) * 255
-                vor_edge_px = cv2.resize(vor_edge, (w_pitch, h_pitch), interpolation=cv2.INTER_NEAREST)
-                roi_pitch[vor_edge_px > 0] = (
-                    0.70 * roi_pitch[vor_edge_px > 0] + 0.30 * np.array([210, 230, 210])
-                ).astype(np.uint8)
+                # Borde nítido y fino del área proyectada (tal cual la segunda imagen de referencia)
+                cv2.polylines(plane, [frustum_poly], isClosed=True, color=(225, 245, 225), thickness=2, lineType=cv2.LINE_AA)
 
-                apol_edge = np.zeros((gh, gw), dtype=np.uint8)
-                apol_edge[:, 1:] |= (apol_owner[:, 1:] != apol_owner[:, :-1]).astype(np.uint8) * 255
-                apol_edge[1:, :] |= (apol_owner[1:, :] != apol_owner[:-1, :]).astype(np.uint8) * 255
-                apol_edge_px = cv2.resize(apol_edge, (w_pitch, h_pitch), interpolation=cv2.INTER_NEAREST)
-                roi_pitch[apol_edge_px > 0] = (
-                    0.45 * roi_pitch[apol_edge_px > 0] + 0.55 * np.array([255, 255, 255])
-                ).astype(np.uint8)
-
-                # Barra superior en el minimapa con % de Control Territorial de Apolonio y Voronoi
-                pct_a = spatial_surf["team_a_apollonius_pct"]
-                pct_b = spatial_surf["team_b_apollonius_pct"]
-                vor_a = spatial_surf["team_a_voronoi_pct"]
-                vor_b = spatial_surf["team_b_voronoi_pct"]
-                ctrl_txt = f"Control Apolonio: Eq.A {pct_a:.1f}% vs Eq.B {pct_b:.1f}%  |  Voronoi: {vor_a:.1f}% / {vor_b:.1f}%"
-                cv2.rectangle(plane, (pad, 4), (pad + w_pitch, pad - 4), (18, 28, 18), -1)
-                cv2.putText(
-                    plane,
-                    ctrl_txt,
-                    (pad + 10, pad - 10),
-                    font,
-                    0.42,
-                    (240, 255, 240),
-                    1,
-                    lineType=cv2.LINE_AA,
-                )
-
-        # Resaltar únicamente los keypoints inliers verificados sobre el plano 2D
-        for obs in homog_res.keypoints:
-            if not obs.is_inlier:
-                continue
-            kx, ky = self._m_to_px(obs.pitch_m[0], obs.pitch_m[1])
-            col = (0, 255, 255)
-            cv2.circle(plane, (kx, ky), 5, col, -1, lineType=cv2.LINE_AA)
-            cv2.putText(plane, obs.kp_id, (kx + 5, ky - 3), font, 0.34, col, 1, lineType=cv2.LINE_AA)
+        # 2. Resaltar keypoints sobre el plano 2D SOLO si estamos en modo diagnóstico explícito
+        if not self.clean_view and self.draw_keypoints:
+            for obs in homog_res.keypoints:
+                if not obs.is_inlier:
+                    continue
+                kx, ky = self._m_to_px(obs.pitch_m[0], obs.pitch_m[1])
+                col = (0, 255, 255)
+                cv2.circle(plane, (kx, ky), 5, col, -1, lineType=cv2.LINE_AA)
+                cv2.putText(plane, obs.kp_id, (kx + 5, ky - 3), font, 0.34, col, 1, lineType=cv2.LINE_AA)
 
         # Actualizar y dibujar trayectorias, vectores de velocidad de Apolonio y posiciones 2D de los jugadores
         for p in players:

@@ -155,9 +155,9 @@ class BallPhysicsTracker:
         if not self.enable_dynamic_roi or self.state == BallState.LOST or self.kf_px is None:
             return None
 
-        if self.state == BallState.COASTING and self.missing_frames > 6:
-            return None
-        if self.state == BallState.OCCLUDED_BY_PLAYER and self.missing_frames > 12:
+        # Si hay más de 2 cuadros sin detección o si está en oclusión, buscar en todo el cuadro
+        # para no quedar atrapado en los pies de un jugador cuando el balón fue pateado/pasado
+        if self.missing_frames >= 2 or self.state == BallState.OCCLUDED_BY_PLAYER:
             return None
 
         cx = float(self.kf_px.x[0] + self.kf_px.x[2])
@@ -259,7 +259,28 @@ class BallPhysicsTracker:
             self._tentative_cand = (self.last_frame_idx + 1, cx, cy, best.get("pitch_m"))
             return None
 
-        # Estado activo (LOCKED, COASTING, OCCLUDED_BY_PLAYER): Evaluar Verosimilitud Espacial + Apolonio
+        # Si estamos en oclusión, evaluar si un jugador pateó/pasó el balón hacia la cancha abierta
+        if self.state == BallState.OCCLUDED_BY_PLAYER:
+            pitch_candidates = [
+                c for c in candidates
+                if (not homography_valid or self._is_within_pitch_bounds(c.get("pitch_m"), margin_m=3.5))
+                and float(c["conf"]) >= max(0.25, self.conf_low)
+            ]
+            if pitch_candidates:
+                # Ordenar por confianza descendente
+                pitch_candidates.sort(key=lambda c: float(c["conf"]), reverse=True)
+                top_cand = pitch_candidates[0]
+                top_conf = float(top_cand["conf"])
+                cx, cy = top_cand["center_px"]
+                dist_to_carrier = float(np.hypot(cx - pred_px[0], cy - pred_px[1]))
+                # Si el candidato está claramente en cancha abierta (> 40 px del pie) o tiene buena confianza (>= 0.30)
+                if top_conf >= 0.30 or dist_to_carrier > 40.0:
+                    c_copy = dict(top_cand)
+                    c_copy["likelihood_score"] = round(top_conf, 3)
+                    self.carrier_player_id = None
+                    return c_copy
+
+        # Estado activo (LOCKED, COASTING): Evaluar Verosimilitud Espacial + Apolonio
         sigma_px = self.base_gate_px + self.gate_expansion_px * float(min(dt_frames, 15))
         max_jump_px = self.max_ball_jump_px_per_frame * float(max(1, min(dt_frames, 10)))
         max_jump_m = self.max_ball_speed_mps * dt_sec + 3.0
@@ -280,15 +301,15 @@ class BallPhysicsTracker:
             conf = float(c["conf"])
             dist_px = float(np.hypot(cx - pred_px[0], cy - pred_px[1]))
 
-            # Compuerta cinemática máxima en píxeles
-            if dist_px > max_jump_px and conf < 0.75:
+            # Compuerta cinemática en píxeles (si conf >= 0.45, permitir reconexión de pase rápido)
+            if dist_px > max_jump_px and conf < 0.45:
                 continue
 
             # Compuerta física en metros sobre la cancha 2D
             cm = c.get("pitch_m")
             if homography_valid and pred_m is not None and cm is not None:
                 dist_m = float(np.hypot(cm[0] - pred_m[0], cm[1] - pred_m[1]))
-                if dist_m > max_jump_m and conf < 0.80:
+                if dist_m > max_jump_m and conf < 0.50:
                     continue
 
             spatial_prob = float(np.exp(-(dist_px**2) / (2.0 * (sigma_px**2))))
@@ -432,9 +453,18 @@ class BallPhysicsTracker:
 
             if self.state != BallState.LOST and pred_px is not None:
                 # Verificar si un jugador está ocluyendo/conduciendo el balón
+                ball_speed = (
+                    float(np.hypot(self.kf_pitch.x[2], self.kf_pitch.x[3]))
+                    if self.kf_pitch is not None
+                    else 0.0
+                )
                 closest_p, d_m, d_px = self._find_closest_player(pred_px, pred_m, players)
-                is_near_player = closest_p is not None and (
-                    d_m <= self.player_occlusion_radius_m or d_px <= self.player_occlusion_radius_px
+                # Solo anclar por oclusión si el balón iba despacio (< 3.8 m/s, disputa/conducción).
+                # Si el balón iba rápido en un pase/tiro, NO anclarlo a los pies de jugadores cercanos.
+                is_near_player = (
+                    closest_p is not None
+                    and (d_m <= self.player_occlusion_radius_m or d_px <= self.player_occlusion_radius_px)
+                    and ball_speed < 3.8
                 )
 
                 if is_near_player and self.missing_frames <= self.max_occlusion_frames:
