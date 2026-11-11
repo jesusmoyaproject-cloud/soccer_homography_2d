@@ -190,22 +190,25 @@ class Tactical2DRenderer:
         # 2. Keypoints detectados con ID numérico limpio
         if self.draw_keypoints:
             for obs in homog_res.keypoints:
-                if not obs.is_inlier:
+                if not obs.is_inlier and obs.confidence < 0.25:
                     continue
                 sx, sy = int(round(obs.stabilized_px[0])), int(round(obs.stabilized_px[1]))
-                kp_col = (0, 255, 255)
+                if not (0 <= sx < out.shape[1] and 0 <= sy < out.shape[0]):
+                    continue
+
+                kp_col = (0, 255, 255) if obs.is_inlier else (0, 180, 255)
 
                 # Círculo amarillo nítido con borde negro de contraste
-                cv2.circle(out, (sx, sy), 5, (0, 0, 0), -1, lineType=cv2.LINE_AA)
+                cv2.circle(out, (sx, sy), 6, (0, 0, 0), -1, lineType=cv2.LINE_AA)
                 cv2.circle(out, (sx, sy), 4, kp_col, -1, lineType=cv2.LINE_AA)
 
                 kp_label = str(obs.kp_id)
-                (tw, th), _ = cv2.getTextSize(kp_label, font, 0.38, 1)
-                bx1, by1 = sx - tw // 2 - 3, max(2, sy - th - 8)
+                (tw, th), _ = cv2.getTextSize(kp_label, font, 0.40, 1)
+                bx1, by1 = max(2, sx - tw // 2 - 3), max(2, sy - th - 8)
                 bx2, by2 = bx1 + tw + 6, by1 + th + 4
                 cv2.rectangle(out, (bx1, by1), (bx2, by2), (18, 24, 38), -1)
                 cv2.rectangle(out, (bx1, by1), (bx2, by2), kp_col, 1)
-                cv2.putText(out, kp_label, (bx1 + 3, by2 - 2), font, 0.38, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+                cv2.putText(out, kp_label, (bx1 + 3, by2 - 2), font, 0.40, (255, 255, 255), 1, lineType=cv2.LINE_AA)
 
         # 3. Jugadores detectados (solo IDs detectados y visualización limpia)
         for p in players:
@@ -401,16 +404,18 @@ class Tactical2DRenderer:
                 # Borde nítido y fino del área proyectada (tal cual la segunda imagen de referencia)
                 cv2.polylines(plane, [frustum_poly], isClosed=True, color=(225, 245, 225), thickness=2, lineType=cv2.LINE_AA)
 
-        # 2. Resaltar keypoints sobre el plano 2D (inliers detectados)
+        # 2. Resaltar keypoints sobre el plano 2D (inliers y detectados)
         if self.draw_keypoints:
             for obs in homog_res.keypoints:
-                if not obs.is_inlier:
+                if not obs.is_inlier and obs.confidence < 0.25:
+                    continue
+                if obs.pitch_m is None:
                     continue
                 kx, ky = self._m_to_px(obs.pitch_m[0], obs.pitch_m[1])
-                col = (0, 255, 255)
-                cv2.circle(plane, (kx, ky), 5, (0, 0, 0), -1, lineType=cv2.LINE_AA)
+                col = (0, 255, 255) if obs.is_inlier else (0, 180, 255)
+                cv2.circle(plane, (kx, ky), 6, (0, 0, 0), -1, lineType=cv2.LINE_AA)
                 cv2.circle(plane, (kx, ky), 4, col, -1, lineType=cv2.LINE_AA)
-                cv2.putText(plane, str(obs.kp_id), (kx + 6, ky - 2), font, 0.36, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+                cv2.putText(plane, str(obs.kp_id), (kx + 6, ky - 2), font, 0.38, (255, 255, 255), 1, lineType=cv2.LINE_AA)
 
         # Actualizar y dibujar trayectorias, vectores de velocidad de Apolonio y posiciones 2D de los jugadores
         for p in players:

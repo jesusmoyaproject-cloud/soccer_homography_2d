@@ -60,6 +60,7 @@ class Soccer2DTrackingPipeline:
         two_pass_override: Optional[bool] = None,
         imgsz_override: Optional[int] = None,
         clean_view_override: Optional[bool] = None,
+        draw_keypoints_override: Optional[bool] = None,
     ):
         self.config = load_yaml_config(config_path)
 
@@ -73,13 +74,16 @@ class Soccer2DTrackingPipeline:
             self.config.setdefault("tracking_2d", {})["enable_two_pass"] = bool(two_pass_override)
         if imgsz_override is not None:
             self.config.setdefault("detection", {})["imgsz"] = int(imgsz_override)
+        
+        vis_c = self.config.setdefault("visualization", {})
         if clean_view_override is not None:
-            vis_c = self.config.setdefault("visualization", {})
             vis_c["clean_view"] = bool(clean_view_override)
             if clean_view_override:
-                vis_c["draw_keypoints"] = False
                 vis_c["draw_hud_banner"] = False
                 vis_c["draw_projected_lines"] = False
+
+        if draw_keypoints_override is not None:
+            vis_c["draw_keypoints"] = bool(draw_keypoints_override)
 
         self.enable_two_pass = bool(
             self.config.get("tracking_2d", {}).get("enable_two_pass", True)
@@ -850,6 +854,19 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Modo diagnóstico: muestra keypoints, líneas de homografía y banner de estado (por defecto está desactivado para un video limpio)",
     )
+    parser.add_argument(
+        "--draw-keypoints", "--keypoints",
+        dest="draw_keypoints",
+        action="store_true",
+        default=None,
+        help="Forzar pintar keypoints detectados con sus identificadores numéricos en el video y en la cancha 2D",
+    )
+    parser.add_argument(
+        "--no-keypoints",
+        dest="draw_keypoints",
+        action="store_false",
+        help="Ocultar keypoints en la visualización",
+    )
     return parser.parse_args()
 
 
@@ -870,6 +887,7 @@ def main() -> None:
         two_pass_override=(False if args.single_pass else None),
         imgsz_override=args.imgsz,
         clean_view_override=(False if args.diagnostic else True),
+        draw_keypoints_override=args.draw_keypoints,
     )
     pipeline.process(
         input_path=input_source,
