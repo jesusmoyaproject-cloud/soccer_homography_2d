@@ -512,6 +512,9 @@ class Soccer2DTrackingPipeline:
                         end="",
                         flush=True,
                     )
+        except KeyboardInterrupt:
+            print(f"\n⚠️ [INTERRUPCIÓN DETECTADA] Se detuvo manualmente en el cuadro {frame_idx}/{target_frames}.")
+            print("   Salvando progreso y ejecutando Pasada 2 sobre los cuadros procesados...")
         finally:
             reader.release()
             print()
@@ -619,6 +622,8 @@ class Soccer2DTrackingPipeline:
                     if render_idx % 20 == 0 or render_idx == frame_idx:
                         pct = (render_idx / max(1, frame_idx)) * 100.0
                         print(f"\r   [Render 2D] {render_idx}/{frame_idx} ({pct:5.1f}%)", end="", flush=True)
+            except KeyboardInterrupt:
+                print(f"\n⚠️ [RENDER INTERRUMPIDO] Se detuvo en el cuadro {render_idx}. Cerrando archivo de video...")
             finally:
                 reader_render.release()
                 if writer is not None:
