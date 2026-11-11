@@ -712,6 +712,93 @@ class BallTrajectoryReconstructor:
 
         return spikes_removed
 
+    def _filter_frame_to_frame_jumps(self, rows: List[Dict[str, Any]]) -> int:
+        """
+        Filtro estricto anti-saltos bruscos de frame a frame en la Pasada 2:
+        1. Comprueba secuencialmente la velocidad de avance entre cuadros contiguos.
+           Si la distancia recorrida en un solo cuadro excede el límite físico
+           (v > 34 m/s o salto en cámara > 75 px/cuadro), descarta el punto como falso positivo.
+        2. Protege la continuidad de la trayectoria evitando quiebres abruptos no físicos.
+        """
+        removed = 0
+        detected_indices = [
+            i for i, r in enumerate(rows)
+            if r.get("detected", False)
+            and r.get("center_px_x") is not None
+            and r.get("center_px_y") is not None
+        ]
+        if len(detected_indices) < 2:
+            return 0
+
+        valid_chain = [detected_indices[0]]
+        for k in range(1, len(detected_indices)):
+            idx_curr = detected_indices[k]
+            idx_prev = valid_chain[-1]
+            r_prev = rows[idx_prev]
+            r_curr = rows[idx_curr]
+
+            if r_curr.get("shot_cut") or r_prev.get("shot_cut"):
+                valid_chain.append(idx_curr)
+                continue
+
+            dt_frames = max(1, int(r_curr["frame"]) - int(r_prev["frame"]))
+            dt_sec = dt_frames / self.fps
+
+            d_px = float(np.hypot(
+                float(r_curr["center_px_x"]) - float(r_prev["center_px_x"]),
+                float(r_curr["center_px_y"]) - float(r_prev["center_px_y"]),
+            ))
+            max_allowed_px = 75.0 * dt_frames + 20.0
+
+            has_pitch = (
+                r_prev.get("pitch_x_m") is not None
+                and r_prev.get("pitch_y_m") is not None
+                and r_curr.get("pitch_x_m") is not None
+                and r_curr.get("pitch_y_m") is not None
+            )
+            is_valid_jump = True
+            if has_pitch:
+                d_m = float(np.hypot(
+                    float(r_curr["pitch_x_m"]) - float(r_prev["pitch_x_m"]),
+                    float(r_curr["pitch_y_m"]) - float(r_prev["pitch_y_m"]),
+                ))
+                v_mps = d_m / dt_sec
+                if v_mps > self.max_ball_speed_mps or d_px > max_allowed_px:
+                    is_valid_jump = False
+            elif d_px > max_allowed_px:
+                is_valid_jump = False
+
+            if not is_valid_jump:
+                # Comprobar si los cuadros siguientes respaldan la nueva posición
+                supported_by_future = False
+                if k + 1 < len(detected_indices):
+                    idx_next = detected_indices[k + 1]
+                    r_next = rows[idx_next]
+                    dt_f2 = max(1, int(r_next["frame"]) - int(r_curr["frame"]))
+                    d_px_next = float(np.hypot(
+                        float(r_next["center_px_x"]) - float(r_curr["center_px_x"]),
+                        float(r_next["center_px_y"]) - float(r_curr["center_px_y"]),
+                    ))
+                    if d_px_next <= (75.0 * dt_f2 + 20.0):
+                        supported_by_future = True
+
+                if not supported_by_future:
+                    r_curr["detected"] = False
+                    r_curr["state"] = "JUMP_REMOVED"
+                    r_curr["center_px_x"] = None
+                    r_curr["center_px_y"] = None
+                    r_curr["pitch_x_m"] = None
+                    r_curr["pitch_y_m"] = None
+                    r_curr["is_interpolated"] = True
+                    removed += 1
+                    continue
+                else:
+                    valid_chain.append(idx_curr)
+            else:
+                valid_chain.append(idx_curr)
+
+        return removed
+
     def reconstruct(
         self,
         raw_ball_records: List[Dict[str, Any]],
@@ -720,9 +807,9 @@ class BallTrajectoryReconstructor:
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
         Ejecuta la reconstrucción post-inferencia completa sobre la serie del balón:
-        1. Poda de picos espurios.
+        1. Poda de picos espurios y filtro estricto anti-saltos bruscos frame-a-frame.
         2. Interpolación de huecos entre detecciones reales (guiada por jugador o lineal/Hermite).
-        3. Suavizado ligero preservador de vértices y recálculo de velocidades.
+        3. Suavizado cinemático continuo en píxeles y metros 2D, y recálculo de velocidades.
         4. Clasificación y ajuste balístico 3D (Parábolas aéreas y Efecto Magnus).
         """
         if not raw_ball_records:
@@ -731,8 +818,10 @@ class BallTrajectoryReconstructor:
         rows = [dict(r) for r in raw_ball_records]
         rows.sort(key=lambda r: int(r["frame"]))
 
-        # Paso 1: Eliminar picos cinemáticos imposibles
+        # Paso 1: Eliminar picos cinemáticos imposibles y saltos bruscos
         spikes_removed = self._remove_kinematic_spikes(rows)
+        jumps_removed = self._filter_frame_to_frame_jumps(rows)
+        spikes_removed += jumps_removed
 
         # Paso 2: Interpolar huecos acotados (<= max_interp_gap_frames) sin corte de cámara
         detected_idxs = [
@@ -821,7 +910,7 @@ class BallTrajectoryReconstructor:
                     )
 
                 # Si durante el hueco el balón estaba ocluido por un jugador poseedor conocido,
-                # combinar suavemente con la posición de los pies de ese jugador
+                # combinar solo si el jugador estaba en contacto físico directo (d <= 25 px)
                 carrier_id = row_m.get("carrier_id")
                 if carrier_id is not None and stitched_players_by_frame is not None and pivot is None:
                     frame_players = stitched_players_by_frame.get(f_num, [])
@@ -836,20 +925,24 @@ class BallTrajectoryReconstructor:
                     )
                     if carrier is not None:
                         cfx, cfy = carrier["foot_px"]
-                        if float(np.hypot(cfx - ix_px, cfy - iy_px)) <= 85.0:
-                            ix_px = 0.55 * ix_px + 0.45 * cfx
-                            iy_px = 0.55 * iy_px + 0.45 * cfy
+                        # Solo atraer si el jugador está efectivamente en contacto con el balón (distancia <= 25 px)
+                        if float(np.hypot(cfx - ix_px, cfy - iy_px)) <= 25.0:
+                            ix_px = 0.85 * ix_px + 0.15 * cfx
+                            iy_px = 0.85 * iy_px + 0.15 * cfy
                             if ix_m is not None and carrier.get("pitch_m") is not None:
-                                ix_m = 0.55 * ix_m + 0.45 * float(carrier["pitch_m"][0])
-                                iy_m = 0.55 * iy_m + 0.45 * float(carrier["pitch_m"][1])
+                                ix_m = 0.85 * ix_m + 0.15 * float(carrier["pitch_m"][0])
+                                iy_m = 0.85 * iy_m + 0.15 * float(carrier["pitch_m"][1])
 
                 row_m["center_px_x"] = round(float(ix_px), 2)
                 row_m["center_px_y"] = round(float(iy_px), 2)
-                row_m["bbox_w"] = round((1.0 - alpha) * float(r_a["bbox_w"]) + alpha * float(r_b["bbox_w"]), 2)
-                row_m["bbox_h"] = round((1.0 - alpha) * float(r_a["bbox_h"]) + alpha * float(r_b["bbox_h"]), 2)
+                bw_a, bw_b = float(r_a.get("bbox_w", 16.0)), float(r_b.get("bbox_w", 16.0))
+                bh_a, bh_b = float(r_a.get("bbox_h", 16.0)), float(r_b.get("bbox_h", 16.0))
+                conf_a, conf_b = float(r_a.get("conf", 0.5)), float(r_b.get("conf", 0.5))
+                row_m["bbox_w"] = round((1.0 - alpha) * bw_a + alpha * bw_b, 2)
+                row_m["bbox_h"] = round((1.0 - alpha) * bh_a + alpha * bh_b, 2)
                 row_m["pitch_x_m"] = round(float(ix_m), 3) if ix_m is not None else None
                 row_m["pitch_y_m"] = round(float(iy_m), 3) if iy_m is not None else None
-                row_m["conf"] = round((1.0 - alpha) * float(r_a["conf"]) + alpha * float(r_b["conf"]), 3)
+                row_m["conf"] = round((1.0 - alpha) * conf_a + alpha * conf_b, 3)
                 if pivot is not None:
                     row_m["state"] = "RECONSTRUCTED_APOLLONIUS_TOUCH"
                 else:
@@ -857,7 +950,7 @@ class BallTrajectoryReconstructor:
                 row_m["is_interpolated"] = True
                 interpolated_count += 1
 
-        # Paso 3: Suavizado preservador de rebotes y cálculo de velocidad instantánea (m/s)
+        # Paso 3: Suavizado cinemático conjunto en píxeles y metros 2D, y cálculo de velocidad
         if self.enable_smoothing:
             self._smooth_and_compute_velocity(rows)
 
@@ -881,14 +974,44 @@ class BallTrajectoryReconstructor:
 
     def _smooth_and_compute_velocity(self, rows: List[Dict[str, Any]]) -> None:
         """
-        Aplica un filtro de media móvil ponderada [0.2, 0.6, 0.2] sobre puntos interiores
-        que no representen un rebote/cambio brusco de dirección (> 35 grados) y calcula `speed_mps`.
+        Aplica un filtro de suavizado cinemático [0.15, 0.70, 0.15] sobre coordenadas de píxeles
+        y de cancha 2D, amortiguando micro-bucles hacia atrás (overshoots) y recalculando
+        velocidades instantáneas realistas.
         """
         n = len(rows)
         for i in range(1, n - 1):
             r_prev, r_curr, r_next = rows[i - 1], rows[i], rows[i + 1]
             if r_curr.get("shot_cut") or r_next.get("shot_cut"):
                 continue
+
+            # Suavizado en píxeles de cámara (elimina quiebres espurios en video)
+            if (
+                r_prev.get("center_px_x") is not None
+                and r_curr.get("center_px_x") is not None
+                and r_next.get("center_px_x") is not None
+            ):
+                c0 = np.array([float(r_prev["center_px_x"]), float(r_prev["center_px_y"])])
+                c1 = np.array([float(r_curr["center_px_x"]), float(r_curr["center_px_y"])])
+                c2 = np.array([float(r_next["center_px_x"]), float(r_next["center_px_y"])])
+                v1_c = c1 - c0
+                v2_c = c2 - c1
+                n1_c = float(np.linalg.norm(v1_c))
+                n2_c = float(np.linalg.norm(v2_c))
+
+                # Amortiguar si hay retroceso o micro-bucle agudo en píxeles
+                if n1_c > 0.5 and n2_c > 0.5:
+                    cos_c = float(np.dot(v1_c, v2_c) / (n1_c * n2_c))
+                    if cos_c < -0.3 and (n1_c < 30.0 or n2_c < 30.0):
+                        smooth_c = 0.5 * c0 + 0.5 * c2
+                    else:
+                        smooth_c = 0.15 * c0 + 0.70 * c1 + 0.15 * c2
+                else:
+                    smooth_c = 0.15 * c0 + 0.70 * c1 + 0.15 * c2
+
+                r_curr["center_px_x"] = round(float(smooth_c[0]), 2)
+                r_curr["center_px_y"] = round(float(smooth_c[1]), 2)
+
+            # Suavizado en coordenadas de cancha 2D
             if (
                 r_prev.get("pitch_x_m") is not None
                 and r_curr.get("pitch_x_m") is not None
@@ -902,13 +1025,16 @@ class BallTrajectoryReconstructor:
                 n_in = float(np.linalg.norm(v_in))
                 n_out = float(np.linalg.norm(v_out))
 
-                # Solo suavizar si no es un vértice de pase/rebote
                 if n_in > 0.05 and n_out > 0.05:
                     cos_ang = float(np.dot(v_in, v_out) / (n_in * n_out))
-                    if cos_ang > 0.82:  # Ángulo < ~35°
-                        smooth_p = 0.20 * p0 + 0.60 * p1 + 0.20 * p2
-                        r_curr["pitch_x_m"] = round(float(smooth_p[0]), 3)
-                        r_curr["pitch_y_m"] = round(float(smooth_p[1]), 3)
+                    if cos_ang < -0.3 and (n_in < 1.5 or n_out < 1.5):
+                        smooth_p = 0.5 * p0 + 0.5 * p2
+                    elif cos_ang > 0.70:
+                        smooth_p = 0.15 * p0 + 0.70 * p1 + 0.15 * p2
+                    else:
+                        smooth_p = p1
+                    r_curr["pitch_x_m"] = round(float(smooth_p[0]), 3)
+                    r_curr["pitch_y_m"] = round(float(smooth_p[1]), 3)
 
                 dt = max(1, int(r_curr["frame"]) - int(r_prev["frame"])) / self.fps
                 spd = float(np.linalg.norm(p1 - p0) / dt)

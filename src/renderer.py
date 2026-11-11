@@ -40,7 +40,7 @@ class Tactical2DRenderer:
         self.trail_length = int(vis_cfg.get("trail_length", 35))
         self.clean_view = bool(vis_cfg.get("clean_view", True))
         self.draw_projected_lines = bool(vis_cfg.get("draw_projected_lines", not self.clean_view))
-        self.draw_keypoints = bool(vis_cfg.get("draw_keypoints", not self.clean_view))
+        self.draw_keypoints = bool(vis_cfg.get("draw_keypoints", True))
         self.draw_hud_banner = bool(vis_cfg.get("draw_hud_banner", not self.clean_view))
         self.draw_camera_frustum = bool(vis_cfg.get("draw_camera_frustum", True))
         self.enable_voronoi_apollonius = bool(vis_cfg.get("enable_voronoi_apollonius", False))
@@ -187,28 +187,25 @@ class Tactical2DRenderer:
         if homog_res.is_valid and homog_res.H_inv is not None:
             self.draw_projected_pitch_lines(out, homog_res.H_inv)
 
-        # 2. Keypoints detectados con ID y conf
+        # 2. Keypoints detectados con ID numérico limpio
         if self.draw_keypoints:
             for obs in homog_res.keypoints:
+                if not obs.is_inlier:
+                    continue
                 sx, sy = int(round(obs.stabilized_px[0])), int(round(obs.stabilized_px[1]))
-                rx, ry = int(round(obs.raw_px[0])), int(round(obs.raw_px[1]))
+                kp_col = (0, 255, 255)
 
-                # Si fue estabilizado por Método 1 o 2, mostrar línea entre detección cruda y estabilizada
-                if (sx, sy) != (rx, ry):
-                    cv2.line(out, (rx, ry), (sx, sy), (0, 165, 255), 1, lineType=cv2.LINE_AA)
-                    cv2.circle(out, (rx, ry), 2, (0, 140, 255), -1, lineType=cv2.LINE_AA)
-
-                kp_col = (0, 255, 255) if obs.is_inlier else (0, 60, 255)
+                # Círculo amarillo nítido con borde negro de contraste
                 cv2.circle(out, (sx, sy), 5, (0, 0, 0), -1, lineType=cv2.LINE_AA)
                 cv2.circle(out, (sx, sy), 4, kp_col, -1, lineType=cv2.LINE_AA)
 
-                kp_label = f"KP:{obs.kp_id} {obs.confidence:.2f}"
+                kp_label = str(obs.kp_id)
                 (tw, th), _ = cv2.getTextSize(kp_label, font, 0.38, 1)
-                bx1, by1 = sx - tw // 2 - 2, max(2, sy - th - 10)
-                bx2, by2 = bx1 + tw + 4, by1 + th + 4
+                bx1, by1 = sx - tw // 2 - 3, max(2, sy - th - 8)
+                bx2, by2 = bx1 + tw + 6, by1 + th + 4
                 cv2.rectangle(out, (bx1, by1), (bx2, by2), (18, 24, 38), -1)
                 cv2.rectangle(out, (bx1, by1), (bx2, by2), kp_col, 1)
-                cv2.putText(out, kp_label, (bx1 + 2, by2 - 2), font, 0.38, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+                cv2.putText(out, kp_label, (bx1 + 3, by2 - 2), font, 0.38, (255, 255, 255), 1, lineType=cv2.LINE_AA)
 
         # 3. Jugadores detectados (solo IDs detectados y visualización limpia)
         for p in players:
@@ -260,6 +257,11 @@ class Tactical2DRenderer:
             # Solo añadir a la estela de cámara si es una detección real o reconstrucción en vuelo
             # (evita dibujar líneas erráticas hacia los pies de jugadores en oclusiones especulativas)
             if not (is_interp and b.get("state") == "OCCLUDED_BY_PLAYER"):
+                if len(self.ball_trail_cam) >= 1:
+                    last_c = self.ball_trail_cam[-1]
+                    jump_px = float(np.hypot(cx - last_c[0], cy - last_c[1]))
+                    if jump_px > 85.0:
+                        self.ball_trail_cam.clear()
                 self.ball_trail_cam.append((cx, cy))
 
             if len(self.ball_trail_cam) >= 2:
@@ -399,15 +401,16 @@ class Tactical2DRenderer:
                 # Borde nítido y fino del área proyectada (tal cual la segunda imagen de referencia)
                 cv2.polylines(plane, [frustum_poly], isClosed=True, color=(225, 245, 225), thickness=2, lineType=cv2.LINE_AA)
 
-        # 2. Resaltar keypoints sobre el plano 2D SOLO si estamos en modo diagnóstico explícito
-        if not self.clean_view and self.draw_keypoints:
+        # 2. Resaltar keypoints sobre el plano 2D (inliers detectados)
+        if self.draw_keypoints:
             for obs in homog_res.keypoints:
                 if not obs.is_inlier:
                     continue
                 kx, ky = self._m_to_px(obs.pitch_m[0], obs.pitch_m[1])
                 col = (0, 255, 255)
-                cv2.circle(plane, (kx, ky), 5, col, -1, lineType=cv2.LINE_AA)
-                cv2.putText(plane, obs.kp_id, (kx + 5, ky - 3), font, 0.34, col, 1, lineType=cv2.LINE_AA)
+                cv2.circle(plane, (kx, ky), 5, (0, 0, 0), -1, lineType=cv2.LINE_AA)
+                cv2.circle(plane, (kx, ky), 4, col, -1, lineType=cv2.LINE_AA)
+                cv2.putText(plane, str(obs.kp_id), (kx + 6, ky - 2), font, 0.36, (255, 255, 255), 1, lineType=cv2.LINE_AA)
 
         # Actualizar y dibujar trayectorias, vectores de velocidad de Apolonio y posiciones 2D de los jugadores
         for p in players:
@@ -479,6 +482,11 @@ class Tactical2DRenderer:
                     flight_phase = str(best_ball.get("flight_phase", "GROUND_ROLL"))
 
                     if update_trails:
+                        if len(self.ball_trail_2d) >= 1:
+                            last_2d = self.ball_trail_2d[-1]
+                            jump_2d = float(np.hypot(bpx - last_2d[0], bpy - last_2d[1]))
+                            if jump_2d > (15.0 * self.scale):
+                                self.ball_trail_2d.clear()
                         self.ball_trail_2d.append((bpx, bpy))
 
                     if len(self.ball_trail_2d) >= 2:

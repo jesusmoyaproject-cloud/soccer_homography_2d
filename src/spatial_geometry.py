@@ -280,9 +280,9 @@ def find_apollonius_intermediate_touch(
 
             # Distancia perpendicular/lateral a la cuerda A->B en metros
             dev_m = float(np.hypot(px_m - line_x_m, py_m - line_y_m))
-            # Solo considerar candidatos que estén dentro del radio de alcance de un desvío/control
-            # (entre 0.35 m y 4.2 m de la cuerda ideal)
-            if dev_m > 4.2:
+            # Solo considerar candidatos que estén en contacto directo inmediato con la trayectoria
+            # (máximo 0.85 m de la trayectoria real; distancias mayores son jugadores de paso que no tocaron el balón)
+            if dev_m > 0.85:
                 continue
 
             # Verificar factibilidad cinemática del balón en los dos tramos A->M y M->B
@@ -297,11 +297,11 @@ def find_apollonius_intermediate_touch(
             pvx = float(p.get("vx_mps", 0.0))
             pvy = float(p.get("vy_mps", 0.0))
             t_intercept = apollonius_time_to_intercept(
-                (px_m, py_m), (pvx, pvy), (line_x_m, line_y_m), max_speed_mps=9.5, reaction_time_s=0.12
+                (px_m, py_m), (pvx, pvy), (line_x_m, line_y_m), max_speed_mps=9.5, reaction_time_s=0.10
             )
 
-            # Si el jugador ya está prácticamente sobre el punto de paso (t_intercept <= 0.48s)
-            if t_intercept <= 0.48 and dev_m < best_cost:
+            # Solo si el jugador está efectivamente tocando el balón (t_intercept <= 0.16s)
+            if t_intercept <= 0.16 and dev_m < best_cost:
                 best_cost = dev_m
                 best_pivot = {
                     "frame": f_m,

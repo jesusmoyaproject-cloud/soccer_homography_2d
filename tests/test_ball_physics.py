@@ -200,3 +200,37 @@ def test_ball_reconstructor_full_pass():
     assert "speed_3d_mps" in lookup[2][0]
     assert "flight_phase" in lookup[2][0]
 
+
+def test_frame_to_frame_jump_filter_and_pixel_smoothing():
+    """Verifica que saltos no físicos (outliers) sean filtrados y los píxeles sean suavizados en Pasada 2."""
+    config = {
+        "ball_tracking": {
+            "reconstruction": {
+                "max_ball_speed_mps": 35.0,
+                "max_spike_jump_px": 120.0,
+                "max_interp_gap_frames": 25,
+                "enable_smoothing": True,
+            }
+        }
+    }
+    reconstructor = BallTrajectoryReconstructor(config=config, fps=30.0)
+
+    # Simular una secuencia continua con un falso positivo que salta 25 metros en 1 frame
+    raw_records = [
+        {"frame": 1, "detected": True, "center_px_x": 100.0, "center_px_y": 200.0, "pitch_x_m": 50.0, "pitch_y_m": 30.0, "conf": 0.8},
+        {"frame": 2, "detected": True, "center_px_x": 105.0, "center_px_y": 202.0, "pitch_x_m": 51.0, "pitch_y_m": 30.2, "conf": 0.8},
+        # Falso positivo en el frame 3 (salta bruscamente a 400px y 80m de cancha)
+        {"frame": 3, "detected": True, "center_px_x": 450.0, "center_px_y": 600.0, "pitch_x_m": 85.0, "pitch_y_m": 15.0, "conf": 0.4},
+        # Vuelve a la trayectoria real en el frame 4
+        {"frame": 4, "detected": True, "center_px_x": 115.0, "center_px_y": 206.0, "pitch_x_m": 53.0, "pitch_y_m": 30.6, "conf": 0.8},
+        {"frame": 5, "detected": True, "center_px_x": 120.0, "center_px_y": 208.0, "pitch_x_m": 54.0, "pitch_y_m": 30.8, "conf": 0.8},
+    ]
+
+    reconstructed, stats = reconstructor.reconstruct(raw_records)
+    assert stats["spikes_removed"] >= 1
+    # El frame 3 debe haber sido corregido cinemáticamente hacia la interpolación suave de 105 a 115 px
+    f3 = next(r for r in reconstructed if r["frame"] == 3)
+    assert abs(f3["center_px_x"] - 110.0) < 5.0
+    assert abs(f3["pitch_x_m"] - 52.0) < 1.0
+
+

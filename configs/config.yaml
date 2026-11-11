@@ -138,7 +138,7 @@ video:
 visualization:
   clean_view: true               # Modo limpio: solo marcar inferencias con sus IDs detectados
   draw_projected_lines: false    # Omitir líneas proyectadas sobre la cámara para un video limpio
-  draw_keypoints: false          # Omitir keypoints sobre la cámara
+  draw_keypoints: true           # Pintar keypoints detectados con sus IDs en cámara y plano 2D
   draw_hud_banner: false         # Omitir banner superior de estado
   minimap_scale: 7.0             # Píxeles por metro en el plano 2D
   minimap_padding_m: 5.0         # Margen exterior en metros alrededor de la cancha 2D
